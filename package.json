@@ -17,10 +17,11 @@
     "db:migrate": "npm run migrate -w @deploydeck/db",
     "db:validate": "npm run validate -w @deploydeck/db",
     "test:db": "node --import tsx --test tests/database.test.ts",
-    "test": "node --import tsx --test tests/*.test.ts",
+    "test": "node --import tsx --test --test-concurrency=1 tests/*.test.ts",
     "test:security": "node --import tsx --test tests/security.test.ts",
     "test:api": "node --import tsx --test tests/api.test.ts",
-    "setup": "node scripts/setup.mjs"
+    "setup": "node scripts/setup.mjs",
+    "test:worker": "node --import tsx --test --test-concurrency=1 tests/worker.test.ts tests/build.test.ts"
   },
   "devDependencies": {
     "typescript": "^5.9.3",
