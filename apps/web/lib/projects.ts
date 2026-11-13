@@ -15,7 +15,7 @@ function publicProject(p: Project) {
     health_check_path: p.healthCheckPath, active_deployment_id: p.activeDeploymentId, created_at: p.createdAt,
     active_url: p.activeDeployment?.status === "healthy" ? `${process.env.PUBLIC_PROTOCOL ?? "http"}://project-${p.id}.${process.env.BASE_DOMAIN ?? "localhost"}:${process.env.PUBLIC_PORT ?? "8080"}` : null };
 }
-function validId(id: string) {
+export function validId(id: string) {
   if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) throw new ApiError(404, "Project not found");
 }
 export function createProject(request: Request) {
@@ -69,4 +69,14 @@ export function patchProject(request: Request, id: string) {
     });
     return json({ project: publicProject(p) });
   });
+}
+
+export async function requireProject(id: string, userId: string) {
+  validId(id);
+  const project = await db.project.findFirst({ where: { id, userId } });
+  if (!project) throw new ApiError(404, "Project not found");
+  return project;
+}
+export function projectUrl(id: string) {
+  return `${process.env.PUBLIC_PROTOCOL ?? "http"}://project-${id}.${process.env.BASE_DOMAIN ?? "localhost"}:${process.env.PUBLIC_PORT ?? "8080"}`;
 }
