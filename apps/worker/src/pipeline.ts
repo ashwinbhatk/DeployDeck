@@ -5,8 +5,30 @@ import { clonePinnedRepository, withWorkspace } from "./workspace";
 import { buildImage, ensureDockerfile } from "./build";
 import { StaleDeploymentError, transitionDeploymentStatus } from "./state";
 import type { ClaimedJob } from "./queue";
+async function fail(id: string, phase: "cloning" | "building", error: unknown, log?: BuildLogWriter) {
+  if (error instanceof StaleDeploymentError) return;
+  const raw = error instanceof Error ? error.message : "Deployment build failed";
+  const reason = (log ? log.redact(raw) : "Unable to initialize deployment build").slice(0,4096);
+  if (log) await log.write(`${reason}\n`).catch(() => {});
+  try {
+    await transitionDeploymentStatus(id,phase,"failed",{ failureReason: reason, ...(phase === "building" ? { buildFinishedAt: new Date() } : {}) });
+  } catch (stateError) { if (!(stateError instanceof StaleDeploymentError)) throw stateError; }
+}
+// Phase 4 continues from starting after a verified real image build.
+export async function buildPreparedDeployment(d: { id: string; projectId: string; commitSha: string }, workspace: string, docker: Docker, log: BuildLogWriter, signal: AbortSignal) {
+  let phase: "cloning" | "building" = "cloning";
+  try {
+    await ensureDockerfile(workspace);
+    await transitionDeploymentStatus(d.id,"cloning","building",{ buildStartedAt: new Date() });
+    phase = "building";
+    const imageTag = await buildImage(docker,workspace,d.projectId,d.commitSha,log,signal);
+    await log.write("Build complete. Container startup awaits Phase 4.\n");
+    await log.flush();
+    signal.throwIfAborted();
+    await transitionDeploymentStatus(d.id,"building","starting",{ imageTag, buildFinishedAt: new Date() });
+  } catch (error) { await fail(d.id,phase,error,log); throw error; }
+}
 export async function processClaimedJob(job: ClaimedJob, docker: Docker, signal: AbortSignal) {
-  const state: { phase: "cloning" | "building" } = { phase: "cloning" };
   let log: BuildLogWriter | undefined;
   try {
     const d = await db.deployment.findUniqueOrThrow({ where: { id: job.deploymentId }, include: { project: true } });
@@ -16,24 +38,10 @@ export async function processClaimedJob(job: ClaimedJob, docker: Docker, signal:
     catch { throw new Error("Unable to decrypt deployment environment"); }
     log = new BuildLogWriter(d.id,values);
     const writer = log;
-    const imageTag = await withWorkspace(d.id,async workspace => {
+    await withWorkspace(d.id,async workspace => {
       await clonePinnedRepository(d.project.repoUrl,d.commitSha,workspace,writer,signal);
-      await ensureDockerfile(workspace);
-      await transitionDeploymentStatus(d.id,"cloning","building",{ buildStartedAt: new Date() });
-      state.phase = "building";
-      const image = await buildImage(docker,workspace,d.projectId,d.commitSha,writer,signal);
-      await writer.write("Build complete. Container startup awaits Phase 4.\n");
-      await writer.flush();
-      return image;
+      await buildPreparedDeployment(d,workspace,docker,writer,signal);
     });
-    await transitionDeploymentStatus(d.id,"building","starting",{ imageTag, buildFinishedAt: new Date() });
-  } catch (error) {
-    if (error instanceof StaleDeploymentError) return;
-    const raw = error instanceof Error ? error.message : "Deployment build failed";
-    const reason = (log ? log.redact(raw) : "Unable to initialize deployment build").slice(0,4096);
-    if (log) await log.write(`${reason}\n`).catch(() => {});
-    try {
-      await transitionDeploymentStatus(job.deploymentId,state.phase,"failed",{ failureReason: reason, ...(state.phase === "building" ? { buildFinishedAt: new Date() } : {}) });
-    } catch (stateError) { if (!(stateError instanceof StaleDeploymentError)) throw stateError; }
-  } finally { await log?.flush(); }
+  } catch (error) { await fail(job.deploymentId,"cloning",error,log); }
+  finally { await log?.flush(); }
 }

@@ -9,7 +9,7 @@ export async function claimNextJob(workerId: string): Promise<ClaimedJob | null>
       ORDER BY created_at, id LIMIT 1 FOR UPDATE SKIP LOCKED`;
     if (!rows.length) return null;
     const job = rows[0];
-    await tx.deploymentJob.update({ where: { id: job.id }, data: { status: "claimed", claimedAt: new Date(), claimedBy: workerId } });
+    await tx.$executeRaw`UPDATE deployment_jobs SET status = 'claimed', claimed_at = now(), claimed_by = ${workerId} WHERE id = ${job.id}::uuid AND status = 'pending'`;
     await transitionDeploymentStatus(job.deployment_id, "queued", "cloning", {}, tx);
     return { id: job.id, deploymentId: job.deployment_id, workerId };
   });

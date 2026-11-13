@@ -1,5 +1,5 @@
 import Docker from "dockerode";
-import { lstat, readFile } from "node:fs/promises";
+import { lstat, readFile, readdir } from "node:fs/promises";
 import { join, relative } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { Readable } from "node:stream";
@@ -11,7 +11,7 @@ export async function ensureDockerfile(workspace: string) {
   try { if ((await lstat(join(workspace,"Dockerfile"))).isFile()) return; } catch { /* Report a stable error without local paths. */ }
   throw new Error("Missing Dockerfile in repository root");
 }
-export async function buildContext(workspace: string) {
+export async function buildContext(workspace: string, signal?: AbortSignal) {
   const ignore = dockerIgnore({ ignorecase: false });
   try {
     const path = join(workspace,".dockerignore");
@@ -19,11 +19,26 @@ export async function buildContext(workspace: string) {
     if (!info.isFile() || info.size > 65536) throw new Error("Invalid .dockerignore file");
     ignore.add(await readFile(path,"utf8"));
   } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+  const included = new Set<string>();
+  async function visit(directory: string): Promise<boolean> {
+    signal?.throwIfAborted();
+    let hasIncluded = false;
+    for (const entry of await readdir(join(workspace,directory), { withFileTypes: true })) {
+      signal?.throwIfAborted();
+      const name = directory ? `${directory}/${entry.name}` : entry.name;
+      if (name === ".git" || name.startsWith(".git/")) continue;
+      const childIncluded = entry.isDirectory() ? await visit(name) : false;
+      if (name === "Dockerfile" || name === ".dockerignore" || childIncluded || !ignore.ignores(name)) {
+        included.add(name); hasIncluded = true;
+        if (included.size > 100000) throw new Error("Build context exceeds 100000 entries");
+      }
+    }
+    return hasIncluded;
+  }
+  await visit("");
   return tar.pack(workspace, { dereference: false, ignore: path => {
     const name = relative(workspace,path).split("\\").join("/");
-    if (!name || name === "Dockerfile" || name === ".dockerignore") return false;
-    if (name === ".git" || name.startsWith(".git/")) return true;
-    return ignore.ignores(name);
+    return name !== "" && !included.has(name);
   } });
 }
 export async function buildImage(docker: Docker, workspace: string, projectId: string, sha: string, log: BuildLogWriter, signal: AbortSignal, timeout = BUILD_TIMEOUT) {
@@ -32,15 +47,17 @@ export async function buildImage(docker: Docker, workspace: string, projectId: s
   const imageTag = `deploydeck/${projectId}:${sha.slice(0,12)}`;
   const deadline = new AbortController();
   const combined = AbortSignal.any([signal,deadline.signal]);
-  const timer = setTimeout(() => deadline.abort(),timeout);
+  let timedOut = false;
+  let contextError: Error | undefined;
+  const timer = setTimeout(() => { timedOut = true; deadline.abort(); },timeout);
   let archive: Awaited<ReturnType<typeof buildContext>> | undefined;
   let response: Readable | undefined;
   const abort = () => { archive?.destroy(); response?.destroy(new Error("Build request cancelled")); };
   combined.addEventListener("abort",abort,{once:true});
   try {
     combined.throwIfAborted();
-    archive = await buildContext(workspace);
-    archive.on("error", () => deadline.abort());
+    archive = await buildContext(workspace,combined);
+    archive.on("error", error => { contextError = error; deadline.abort(); });
     combined.throwIfAborted();
     response = await docker.buildImage(archive, { t: imageTag, dockerfile: "Dockerfile", version: "1", rm: true, forcerm: true,
       memory: 256 * 1024 * 1024, cpuperiod: 100000, cpuquota: 50000, abortSignal: combined }) as Readable;
@@ -78,7 +95,8 @@ export async function buildImage(docker: Docker, workspace: string, projectId: s
     return imageTag;
   } catch (error) {
     if (signal.aborted) throw new Error("Deployment interrupted during Docker build");
-    if (deadline.signal.aborted) throw new Error("Docker build timed out or context upload failed");
+    if (timedOut) throw new Error(`Docker build timed out after ${timeout} ms`);
+    if (contextError) throw new Error(`Docker build context upload failed: ${contextError.message}`);
     throw error;
   } finally {
     clearTimeout(timer); combined.removeEventListener("abort",abort);
