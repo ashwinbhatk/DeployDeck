@@ -1,7 +1,9 @@
 import { db } from "@deploydeck/db";
 import Docker from "dockerode";
 import { request } from "node:http";
-import { setTimeout as delay } from "node:timers/promises";
+import { randomUUID } from "node:crypto";
+import { runWorkerLoop } from "./queue";
+import { processClaimedJob } from "./pipeline";
 const abort = new AbortController();
 for (const signal of ["SIGINT", "SIGTERM"] as const) {
   process.once(signal, () => abort.abort());
@@ -24,11 +26,8 @@ async function main() {
   await docker.ping();
   await checkCaddy();
   if (process.argv.includes("--check")) return;
-  console.info("Worker foundation ready; job processing is not implemented yet.");
-  while (!abort.signal.aborted) {
-    await delay(30000, undefined, { signal: abort.signal }).catch(error => {
-      if (!abort.signal.aborted) throw error;
-    });
-  }
+  console.info("Worker ready to process deployment builds.");
+  const buildDocker = new Docker({ socketPath: process.env.DOCKER_SOCKET ?? "/var/run/docker.sock" });
+  await runWorkerLoop(randomUUID(),abort.signal,job => processClaimedJob(job,buildDocker,abort.signal));
 }
 main().catch(() => { console.error("Worker startup failed: verify database, Docker socket, and Caddy admin socket."); process.exitCode = 1; }).finally(() => db.$disconnect());
