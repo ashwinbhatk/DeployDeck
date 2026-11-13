@@ -1,0 +1,99 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model User {
+  id           String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  email        String    @unique
+  passwordHash String    @map("password_hash")
+  createdAt    DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  projects     Project[]
+
+  @@map("users")
+}
+
+model Project {
+  id                   String                @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId               String                @map("user_id") @db.Uuid
+  name                 String
+  repoUrl              String                @map("repo_url")
+  branch               String                @default("main")
+  port                 Int
+  healthCheckPath      String                @default("/") @map("health_check_path")
+  activeDeploymentId   String?               @map("active_deployment_id") @db.Uuid
+  createdAt            DateTime              @default(now()) @map("created_at") @db.Timestamptz(6)
+  user                 User                  @relation(fields: [userId], references: [id], onDelete: Restrict)
+  deployments          Deployment[]          @relation("ProjectDeployments")
+  activeDeployment     Deployment?           @relation("ActiveDeployment", fields: [activeDeploymentId], references: [id], onDelete: SetNull)
+  environmentVariables EnvironmentVariable[]
+
+  @@index([userId])
+  @@map("projects")
+}
+
+model EnvironmentVariable {
+  id             String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  projectId      String   @map("project_id") @db.Uuid
+  key            String
+  valueEncrypted String   @map("value_encrypted")
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  project        Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@unique([projectId, key])
+  @@map("environment_variables")
+}
+
+model Deployment {
+  id              String          @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  projectId       String          @map("project_id") @db.Uuid
+  commitSha       String          @map("commit_sha")
+  imageTag        String?         @map("image_tag")
+  status          String          @default("queued")
+  failureReason   String?         @map("failure_reason")
+  containerId     String?         @map("container_id")
+  hostPort        Int?            @map("host_port")
+  createdAt       DateTime        @default(now()) @map("created_at") @db.Timestamptz(6)
+  queuedAt        DateTime        @default(now()) @map("queued_at") @db.Timestamptz(6)
+  buildStartedAt  DateTime?       @map("build_started_at") @db.Timestamptz(6)
+  buildFinishedAt DateTime?       @map("build_finished_at") @db.Timestamptz(6)
+  startedAt       DateTime?       @map("started_at") @db.Timestamptz(6)
+  healthyAt       DateTime?       @map("healthy_at") @db.Timestamptz(6)
+  stoppedAt       DateTime?       @map("stopped_at") @db.Timestamptz(6)
+  project         Project         @relation("ProjectDeployments", fields: [projectId], references: [id], onDelete: Restrict)
+  activeFor       Project[]       @relation("ActiveDeployment")
+  logs            DeploymentLog[]
+  job             DeploymentJob?
+
+  @@index([projectId, status])
+  @@index([projectId, createdAt(sort: Desc)])
+  @@map("deployments")
+}
+
+model DeploymentLog {
+  id           BigInt     @id @default(autoincrement())
+  deploymentId String     @map("deployment_id") @db.Uuid
+  phase        String
+  line         String
+  ts           DateTime   @default(now()) @db.Timestamptz(6)
+  deployment   Deployment @relation(fields: [deploymentId], references: [id], onDelete: Cascade)
+
+  @@index([deploymentId, ts])
+  @@map("deployment_logs")
+}
+
+model DeploymentJob {
+  id           String     @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  deploymentId String     @unique @map("deployment_id") @db.Uuid
+  status       String     @default("pending")
+  claimedAt    DateTime?  @map("claimed_at") @db.Timestamptz(6)
+  claimedBy    String?    @map("claimed_by")
+  createdAt    DateTime   @default(now()) @map("created_at") @db.Timestamptz(6)
+  deployment   Deployment @relation(fields: [deploymentId], references: [id], onDelete: Cascade)
+
+  @@index([status, createdAt])
+  @@map("deployment_jobs")
+}

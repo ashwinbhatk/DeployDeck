@@ -1,0 +1,100 @@
+name: deploydeck
+services:
+  postgres:
+    image: postgres:17-bookworm
+    environment:
+      POSTGRES_USER: deploydeck
+      POSTGRES_PASSWORD: deploydeck_local
+      POSTGRES_DB: deploydeck
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks: [database]
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U deploydeck -d deploydeck"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  web:
+    build:
+      context: .
+      target: web
+    environment:
+      DATABASE_URL: postgresql://deploydeck:deploydeck_local@postgres:5432/deploydeck
+      BASE_DOMAIN: ${BASE_DOMAIN:-localhost}
+      PUBLIC_PORT: ${PUBLIC_PORT:-8080}
+    ports: ["127.0.0.1:3000:3000"]
+    networks: [database, ingress]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: [CMD, node, -e, "fetch('http://127.0.0.1:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2.10-alpine
+    command: [caddy, run, --config, /etc/caddy/caddy.json]
+    ports: ["127.0.0.1:${PUBLIC_PORT:-8080}:8080"]
+    volumes:
+      - ./infra/caddy/caddy.json:/etc/caddy/caddy.json:ro
+      - caddy_admin:/run/caddy-admin
+      - caddy_data:/data
+      - caddy_config:/config
+    networks: [ingress]
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    healthcheck:
+      test: [CMD-SHELL, "wget -q -O /dev/null http://127.0.0.1:8080/proxy-health"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: .
+      target: worker
+    init: true
+    environment:
+      DATABASE_URL: postgresql://deploydeck:deploydeck_local@postgres:5432/deploydeck
+      DOCKER_SOCKET: /var/run/docker.sock
+      CADDY_ADMIN_SOCKET: /run/caddy-admin/admin.sock
+      CONTAINER_HOST: host.docker.internal
+      BASE_DOMAIN: ${BASE_DOMAIN:-localhost}
+      PUBLIC_PORT: ${PUBLIC_PORT:-8080}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - caddy_admin:/run/caddy-admin
+    networks: [database, worker_egress]
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    depends_on:
+      web:
+        condition: service_healthy
+      caddy:
+        condition: service_healthy
+    healthcheck:
+      test: [CMD, node, apps/worker/dist/index.js, --check]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+      start_period: 15s
+    stop_grace_period: 30s
+    restart: unless-stopped
+
+networks:
+  database:
+    internal: true
+  ingress:
+  worker_egress:
+volumes:
+  postgres_data:
+  caddy_admin:
+  caddy_data:
+  caddy_config:

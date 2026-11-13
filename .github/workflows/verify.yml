@@ -1,0 +1,44 @@
+name: Verify foundation
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  foundation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:17-bookworm
+        env:
+          POSTGRES_USER: deploydeck
+          POSTGRES_PASSWORD: local_test
+          POSTGRES_DB: deploydeck_test
+        ports: [5432:5432]
+        options: >-
+          --health-cmd "pg_isready -U deploydeck -d deploydeck_test"
+          --health-interval 5s --health-timeout 3s --health-retries 20
+    env:
+      DATABASE_URL: postgresql://deploydeck:local_test@localhost:5432/deploydeck_test
+      NEXT_TELEMETRY_DISABLED: 1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run db:validate
+      - run: npm run build
+      - run: npm run typecheck
+      - run: npm run db:migrate
+      - run: npm run db:migrate
+      - run: npm run test:db
+      - run: npm audit --omit=dev --audit-level=high
+      - run: docker compose config --quiet
+      - run: docker compose up --build --wait --wait-timeout 180
+      - run: curl --fail http://localhost:3000/api/health
+      - run: docker compose exec -T caddy caddy validate --config /etc/caddy/caddy.json
+      - run: docker compose logs --no-color
+        if: always()
+      - run: docker compose down -v
+        if: always()

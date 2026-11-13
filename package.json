@@ -1,0 +1,26 @@
+{
+  "name": "deploydeck",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "engines": {
+    "node": ">=22.12"
+  },
+  "scripts": {
+    "dev": "npm run dev -w @deploydeck/web",
+    "build": "npm run db:generate && npm run build -w @deploydeck/db && npm run build -w @deploydeck/web && npm run build -w @deploydeck/worker",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "db:generate": "npm run generate -w @deploydeck/db",
+    "db:migrate": "npm run migrate -w @deploydeck/db",
+    "db:validate": "npm run validate -w @deploydeck/db",
+    "test:db": "node --import tsx --test tests/database.test.ts"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3",
+    "tsx": "^4.20.6",
+    "@types/node": "^22.19.0"
+  }
+}
