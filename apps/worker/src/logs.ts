@@ -12,7 +12,7 @@ export function createRedactor(values: string[]) {
 export class BuildLogWriter {
   private pending = "";
   readonly redact: (text: string) => string;
-  constructor(private deploymentId: string, values: string[]) { this.redact = createRedactor(values); }
+  constructor(private deploymentId: string, values: string[], private phase: "build" | "runtime" = "build") { this.redact = createRedactor(values); }
   async write(text: string) {
     this.pending += text;
     if (this.pending.length > 1024 * 1024) { this.pending = ""; throw new Error("Build output line exceeded 1 MiB limit"); }
@@ -24,7 +24,7 @@ export class BuildLogWriter {
     }
   }
   private async persist(line: string) {
-    await db.deploymentLog.create({ data: { deploymentId: this.deploymentId, phase: "build", line: this.redact(line) } });
+    await db.deploymentLog.create({ data: { deploymentId: this.deploymentId, phase: this.phase, line: this.redact(line) } });
   }
   async flush() { if (this.pending) { const line=this.pending; this.pending=""; await this.persist(line); } }
 }
