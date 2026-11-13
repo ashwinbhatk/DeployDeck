@@ -1,4 +1,4 @@
-import { createCipheriv, createDecipheriv, createHmac, randomBytes, scrypt, timingSafeEqual } from "node:crypto";
+import { createHmac, randomBytes, scrypt, timingSafeEqual } from "node:crypto";
 
 function key(name: "SESSION_SECRET" | "ENCRYPTION_KEY"): Buffer {
   const value = process.env[name];
@@ -36,18 +36,4 @@ export function verifySession(token: string, now = Math.floor(Date.now() / 1000)
     return p.v === 1 && typeof p.sub === "string" && /^[a-f0-9-]{36}$/i.test(p.sub) && Number.isInteger(p.iat) && Number.isInteger(p.exp) && p.iat <= now && p.exp > now && p.exp - p.iat === SESSION_SECONDS ? p.sub : null;
   } catch { return null; }
 }
-export function encryptValue(value: string, context: string): string {
-  const iv = randomBytes(12);
-  const cipher = createCipheriv("aes-256-gcm", key("ENCRYPTION_KEY"), iv, { authTagLength: 16 });
-  cipher.setAAD(Buffer.from(context));
-  const encrypted = Buffer.concat([cipher.update(value, "utf8"), cipher.final()]);
-  return ["v1", iv.toString("hex"), cipher.getAuthTag().toString("hex"), encrypted.toString("hex")].join(":");
-}
-export function decryptValue(value: string, context: string): string {
-  const parts = value.split(":");
-  if (parts.length !== 4 || parts[0] !== "v1" || !/^[a-f0-9]{24}$/.test(parts[1]) || !/^[a-f0-9]{32}$/.test(parts[2]) || !/^(?:[a-f0-9]{2})*$/.test(parts[3])) throw new Error("Invalid encrypted value");
-  const decipher = createDecipheriv("aes-256-gcm", key("ENCRYPTION_KEY"), Buffer.from(parts[1], "hex"), { authTagLength: 16 });
-  decipher.setAAD(Buffer.from(context));
-  decipher.setAuthTag(Buffer.from(parts[2], "hex"));
-  return Buffer.concat([decipher.update(Buffer.from(parts[3], "hex")), decipher.final()]).toString("utf8");
-}
+export { encryptValue, decryptValue } from "@deploydeck/db";

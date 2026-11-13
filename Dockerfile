@@ -27,6 +27,6 @@ COPY apps/worker ./apps/worker
 RUN npm run build -w @deploydeck/worker
 
 FROM worker-build AS worker
-RUN apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends git util-linux && rm -rf /var/lib/apt/lists/*
 ENV NODE_ENV=production
 CMD ["node", "apps/worker/dist/index.js"]
