@@ -6,7 +6,7 @@ const dummyHash = `scrypt-v1$${"0".repeat(32)}$${"0".repeat(128)}`;
 export const runtime = "nodejs";
 export async function POST(request: Request) {
   return api(async () => {
-    const { email, password } = credentials(await body(request));
+    const { email, password } = credentials(await body(request), true);
     const user = await db.user.findUnique({ where: { email } });
     const valid = await verifyPassword(password, user?.passwordHash ?? dummyHash);
     if (!user || !valid) throw new ApiError(401, "Invalid email or password");
