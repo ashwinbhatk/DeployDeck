@@ -32,8 +32,9 @@ jobs:
       - run: npm run typecheck
       - run: npm run db:migrate
       - run: npm run db:migrate
-      - run: npm run test:db
+      - run: npm test
       - run: npm audit --omit=dev --audit-level=high
+      - run: npm run setup
       - run: docker compose config --quiet
       - run: docker compose up --build --wait --wait-timeout 180
       - run: curl --fail http://localhost:3000/api/health
