@@ -1,29 +1,78 @@
 {
-  "admin": { "listen": "unix//run/caddy-admin/admin.sock" },
+  "admin": {
+    "listen": "unix//run/caddy-admin/admin.sock"
+  },
   "apps": {
     "http": {
       "servers": {
         "deploydeck": {
-          "listen": [":8080"],
+          "listen": [
+            ":8080"
+          ],
           "routes": [
             {
-              "match": [{ "host": ["127.0.0.1", "localhost"], "path": ["/proxy-health"] }],
-              "handle": [{ "handler": "static_response", "body": "ready", "status_code": 200 }],
+              "match": [
+                {
+                  "host": [
+                    "127.0.0.1",
+                    "localhost"
+                  ],
+                  "path": [
+                    "/proxy-health"
+                  ]
+                }
+              ],
+              "handle": [
+                {
+                  "handler": "static_response",
+                  "body": "ready",
+                  "status_code": 200
+                }
+              ],
               "terminal": true
             },
             {
               "@id": "project-routes",
-              "handle": [{ "handler": "subroute", "routes": [] }]
+              "handle": [
+                {
+                  "handler": "subroute",
+                  "routes": []
+                }
+              ]
             },
             {
-              "match": [{ "host": ["localhost"] }],
-              "handle": [{ "handler": "reverse_proxy", "upstreams": [{ "dial": "web:3000" }] }],
+              "match": [
+                {
+                  "host": [
+                    "localhost"
+                  ]
+                }
+              ],
+              "handle": [
+                {
+                  "handler": "reverse_proxy",
+                  "upstreams": [
+                    {
+                      "dial": "web:3000"
+                    }
+                  ]
+                }
+              ],
               "terminal": true
             },
             {
-              "handle": [{ "handler": "static_response", "body": "No healthy deployment is routed here.", "status_code": 404 }]
+              "handle": [
+                {
+                  "handler": "static_response",
+                  "body": "No healthy deployment is routed here.",
+                  "status_code": 404
+                }
+              ]
             }
-          ]
+          ],
+          "automatic_https": {
+            "disable": true
+          }
         }
       }
     }
