@@ -64,3 +64,14 @@ export function deploymentDetail(request: Request, id: string) {
     return json({ deployment: deploymentMetadata(row) });
   });
 }
+
+export function deploymentHealth(request: Request, id: string) {
+  return api(async()=>{
+    const user=await requireUser(request);
+    if(!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id))throw new ApiError(404,"Deployment not found");
+    const row=await db.deployment.findFirst({where:{id,project:{userId:user.id}},include:{project:{select:{activeDeploymentId:true}}}});
+    if(!row)throw new ApiError(404,"Deployment not found");
+    return json({id:row.id,status:row.status,container_id:row.containerId,host_port:row.hostPort,healthy_at:row.healthyAt,failure_reason:row.failureReason,
+      active_routing:row.status==="healthy"&&row.project.activeDeploymentId===id,observation_source:"worker_database"});
+  });
+}

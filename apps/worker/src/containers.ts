@@ -39,6 +39,7 @@ export async function ensureProjectNetwork(docker: Docker, projectId: string) {
 }
 export async function startContainer(deploymentId: string, docker: Docker, signal: AbortSignal) {
   let candidate: Docker.Container | undefined;
+  let reservedPort: number | undefined;
   try {
     return await db.$transaction(async tx=>{
       await tx.$executeRaw`SELECT pg_advisory_xact_lock(143832, 1)`;
@@ -53,7 +54,7 @@ export async function startContainer(deploymentId: string, docker: Docker, signa
       const used=new Set([...assigned.map(r=>r.hostPort!),...existing.flatMap(c=>c.Ports.map(p=>p.PublicPort).filter((p):p is number=>!!p))]);
       for(let attempt=0;attempt<5;attempt++) {
         signal.throwIfAborted();
-        const port=await probeHostPort(docker,[...used]);used.add(port);
+        const port=await probeHostPort(docker,[...used]);used.add(port);reservedPort=port;
         await tx.deployment.updateMany({where:{id:d.id,status:"starting"},data:{hostPort:port}});
         candidate=await docker.createContainer({name:`dd-${d.id}`,Image:d.imageTag,Env:env,Tty:false,ExposedPorts:{[`${d.project.port}/tcp`]:{}},
           Labels:{"deploydeck.project":d.projectId,"deploydeck.deployment":d.id},
@@ -73,5 +74,14 @@ export async function startContainer(deploymentId: string, docker: Docker, signa
       }
       throw new Error("Host port allocation conflicted repeatedly");
     },{timeout:120000,maxWait:120000});
-  } catch(error) {if(candidate)await removeContainer(candidate);throw error;}
+  } catch(error) {
+    if(candidate) {
+      try {await removeContainer(candidate);}
+      catch {
+        // Retain ownership metadata if Docker cleanup failed after transaction rollback.
+        await db.deployment.updateMany({where:{id:deploymentId,status:"starting"},data:{containerId:candidate.id,hostPort:reservedPort}});
+      }
+    }
+    throw error;
+  }
 }

@@ -20,7 +20,7 @@ export async function finishJob(job: ClaimedJob) {
 }
 export async function runWorkerLoop(workerId: string, signal: AbortSignal, processJob: (job: ClaimedJob) => Promise<void>) {
   while (!signal.aborted) {
-    const job = await claimNextJob(workerId);
+    const job = await claimNextJob(workerId) ?? await claimPreparedJob(workerId);
     if (!job) {
       await delay(1000, undefined, { signal }).catch(error => { if (!signal.aborted) throw error; });
       continue;
@@ -28,4 +28,19 @@ export async function runWorkerLoop(workerId: string, signal: AbortSignal, proce
     try { await processJob(job); }
     finally { await finishJob(job); }
   }
+}
+
+// Resume completed Phase 3 build jobs that have not started a container yet.
+export async function claimPreparedJob(workerId: string): Promise<ClaimedJob | null> {
+  return db.$transaction(async tx=>{
+    const rows=await tx.$queryRaw<{id:string;deployment_id:string}[]>`
+      SELECT j.id,j.deployment_id FROM deployment_jobs j JOIN deployments d ON d.id=j.deployment_id
+      WHERE j.status='done' AND d.status='starting' AND d.image_tag IS NOT NULL
+        AND d.container_id IS NULL AND d.failure_reason IS NULL
+      ORDER BY j.created_at,j.id LIMIT 1 FOR UPDATE OF j SKIP LOCKED`;
+    if(!rows.length)return null;
+    const row=rows[0];
+    await tx.deploymentJob.update({where:{id:row.id},data:{status:"claimed",claimedAt:new Date(),claimedBy:workerId}});
+    return {id:row.id,deploymentId:row.deployment_id,workerId};
+  });
 }

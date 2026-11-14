@@ -62,6 +62,7 @@ services:
     restart: unless-stopped
 
   worker:
+    image: deploydeck-worker:local
     build:
       context: .
       target: worker
@@ -71,6 +72,9 @@ services:
       ENCRYPTION_KEY: ${ENCRYPTION_KEY:?Run npm run setup to create local keys}
       DOCKER_SOCKET: /var/run/docker.sock
       CADDY_ADMIN_SOCKET: /run/caddy-admin/admin.sock
+      CADDY_ADMIN_URL: ${CADDY_ADMIN_URL:-}
+      PORT_PROBE_IMAGE: ${PORT_PROBE_IMAGE:-deploydeck-worker:local}
+      STARTUP_TIMEOUT: ${STARTUP_TIMEOUT:-60000}
       CONTAINER_HOST: host.docker.internal
       BASE_DOMAIN: ${BASE_DOMAIN:-localhost}
       PUBLIC_PORT: ${PUBLIC_PORT:-8080}

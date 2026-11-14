@@ -14,7 +14,7 @@ async function fail(id: string, phase: "cloning" | "building", error: unknown, l
     await transitionDeploymentStatus(id,phase,"failed",{ failureReason: reason, ...(phase === "building" ? { buildFinishedAt: new Date() } : {}) });
   } catch (stateError) { if (!(stateError instanceof StaleDeploymentError)) throw stateError; }
 }
-// Phase 4 continues from starting after a verified real image build.
+// Startup only follows a verified real image build.
 export async function buildPreparedDeployment(d: { id: string; projectId: string; commitSha: string }, workspace: string, docker: Docker, log: BuildLogWriter, signal: AbortSignal) {
   let phase: "cloning" | "building" = "cloning";
   try {
@@ -22,16 +22,17 @@ export async function buildPreparedDeployment(d: { id: string; projectId: string
     await transitionDeploymentStatus(d.id,"cloning","building",{ buildStartedAt: new Date() });
     phase = "building";
     const imageTag = await buildImage(docker,workspace,d.projectId,d.commitSha,log,signal);
-    await log.write("Build complete. Container startup awaits Phase 4.\n");
+    await log.write("Build complete. Preparing container startup.\n");
     await log.flush();
     signal.throwIfAborted();
     await transitionDeploymentStatus(d.id,"building","starting",{ imageTag, buildFinishedAt: new Date() });
   } catch (error) { await fail(d.id,phase,error,log); throw error; }
 }
-export async function processClaimedJob(job: ClaimedJob, docker: Docker, signal: AbortSignal) {
+export async function processClaimedJob(job: ClaimedJob, docker: Docker, signal: AbortSignal, startRuntime?: (id: string) => Promise<void>) {
   let log: BuildLogWriter | undefined;
   try {
     const d = await db.deployment.findUniqueOrThrow({ where: { id: job.deploymentId }, include: { project: true } });
+    if (d.status === "starting" && startRuntime) {await startRuntime(d.id);return;}
     if (d.status !== "cloning") throw new StaleDeploymentError("Deployment is no longer cloning");
     let values: string[];
     try { values = await deploymentSecrets(d.projectId); }
@@ -42,6 +43,7 @@ export async function processClaimedJob(job: ClaimedJob, docker: Docker, signal:
       await clonePinnedRepository(d.project.repoUrl,d.commitSha,workspace,writer,signal);
       await buildPreparedDeployment(d,workspace,docker,writer,signal);
     });
+    if(startRuntime)await startRuntime(d.id);
   } catch (error) { await fail(job.deploymentId,"cloning",error,log); }
   finally { await log?.flush(); }
 }
