@@ -184,3 +184,60 @@ test("failed build, unhealthy response, timeout and crash preserve the live depl
     await assertServing(live.id, "v1");
   }
 });
+
+test("build and runtime logs redact both encrypted project secrets", async () => {
+  const values = { API_SECRET_KEY: "super-secret-value-123", DB_TOKEN: "tok-987654" };
+  for (const [key, value] of Object.entries(values)) await setVariable(key, value);
+  const live = await deploy();
+  await assertServing(live.id, "v1");
+  await logs.stop(live.id);
+  const rows = await db.deploymentLog.findMany({ where: { deploymentId: live.id } });
+  for (const phase of ["build", "runtime"]) {
+    const lines = rows.filter(row => row.phase === phase).map(row => row.line).join("\n");
+    for (const [key, value] of Object.entries(values)) {
+      assert(lines.includes(key + "=[REDACTED]"), phase + " should mask " + key);
+      assert(!lines.includes(value), phase + " stored plaintext for " + key);
+    }
+  }
+});
+
+test("replacement stops v1 and keeps only the five newest successful image tags", async t => {
+  // Observe committed transitions even when two updates occur between client polls.
+  const schema = "trace_" + projectId.replaceAll("-", "");
+  await db.$transaction(async tx => {
+    await tx.$executeRawUnsafe("CREATE SCHEMA " + schema);
+    await tx.$executeRawUnsafe(`CREATE TABLE ${schema}.states (seq bigserial, id uuid, status text)`);
+    await tx.$executeRawUnsafe(`CREATE FUNCTION ${schema}.record() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN INSERT INTO ${schema}.states (id, status) VALUES (NEW.id, NEW.status); RETURN NEW; END $$`);
+    await tx.$executeRawUnsafe(`CREATE TRIGGER ${schema} AFTER INSERT OR UPDATE OF status ON deployments
+      FOR EACH ROW WHEN (NEW.project_id = '${projectId}') EXECUTE FUNCTION ${schema}.record()`);
+  });
+  t.after(async () => {
+    await db.$transaction(async tx => {
+      await tx.$executeRawUnsafe("DROP TRIGGER " + schema + " ON deployments");
+      await tx.$executeRawUnsafe("DROP SCHEMA " + schema + " CASCADE");
+    });
+  });
+  const versions = [];
+  for (let version = 1; version <= 6; version++) {
+    await setVariable("APP_VERSION", "v" + version);
+    const next = await deploy();
+    assert.equal(next.status, "healthy", next.failureReason ?? undefined);
+    await assertServing(next.id, "v" + version);
+    versions.push(next);
+    if (version === 2) {
+      const first = versions[0];
+      const stopped = await db.deployment.findUniqueOrThrow({ where: { id: first.id } });
+      assert.equal(stopped.status, "stopped");
+      assert(stopped.stoppedAt);
+      assert.equal(stopped.containerId, null);
+      await assert.rejects(docker.getContainer("dd-" + first.id).inspect(), { statusCode: 404 });
+      const history = await db.$queryRawUnsafe<{ status: string }[]>(
+        `SELECT status FROM ${schema}.states WHERE id = $1::uuid ORDER BY seq`, first.id);
+      assert.deepEqual(history.map(row => row.status), ["queued", "cloning", "building", "starting", "healthy", "stopping", "stopped"]);
+      await docker.getImage(first.imageTag!).inspect();
+    }
+  }
+  await assert.rejects(docker.getImage(versions[0].imageTag!).inspect(), { statusCode: 404 });
+  for (const recent of versions.slice(1)) await docker.getImage(recent.imageTag!).inspect();
+});
