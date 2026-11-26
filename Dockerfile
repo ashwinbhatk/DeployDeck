@@ -3,16 +3,12 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends openssl ca-certificates && rm -rf /var/lib/apt/lists/*
 ENV NEXT_TELEMETRY_DISABLED=1
 COPY package.json package-lock.json tsconfig.base.json ./
-COPY packages/db/package.json ./packages/db/package.json
-COPY packages/db/prisma ./packages/db/prisma
-COPY packages/db/prisma.config.ts ./packages/db/prisma.config.ts
-COPY apps/web/package.json ./apps/web/package.json
-COPY apps/worker/package.json ./apps/worker/package.json
-RUN npm ci
 COPY packages/db ./packages/db
-RUN npm run db:generate && npm run build -w @deploydeck/db
 
 FROM base AS web-build
+COPY apps/web/package.json ./apps/web/package.json
+RUN npm ci --include-workspace-root -w @deploydeck/db -w @deploydeck/web
+RUN npm run db:generate && npm run build -w @deploydeck/db
 COPY apps/web ./apps/web
 RUN npm run build -w @deploydeck/web
 
@@ -23,6 +19,9 @@ EXPOSE 3000
 CMD ["sh", "-c", "npm run db:migrate && exec node node_modules/next/dist/bin/next start apps/web --hostname 0.0.0.0"]
 
 FROM base AS worker-build
+COPY apps/worker/package.json ./apps/worker/package.json
+RUN npm ci --include-workspace-root -w @deploydeck/db -w @deploydeck/worker
+RUN npm run db:generate && npm run build -w @deploydeck/db
 COPY apps/worker ./apps/worker
 RUN npm run build -w @deploydeck/worker
 

@@ -39,6 +39,14 @@ jobs:
       - run: npm run setup
       - run: docker compose config --quiet
       - run: docker compose up --build --wait --wait-timeout 180
+      - name: Check web runtime isolation
+        run: |
+          docker compose exec -T web node -e '
+            const assert = require("node:assert/strict");
+            const fs = require("node:fs");
+            assert.throws(() => require.resolve("dockerode"), { code: "MODULE_NOT_FOUND" });
+            for (const path of ["/var/run/docker.sock", "/run/caddy-admin/admin.sock"]) assert(!fs.existsSync(path));
+          '
       - run: curl --fail http://localhost:3000/api/health
       - run: docker compose exec -T caddy caddy validate --config /etc/caddy/caddy.json
       - run: docker compose logs --no-color
