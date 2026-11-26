@@ -45,10 +45,10 @@ export function getProject(request: Request, id: string) {
     const user = await requireUser(request); validId(id);
     const p = await db.project.findFirst({ where: { id, userId: user.id }, select: { ...projectSelect,
       environmentVariables: { select: { key: true }, orderBy: { key: "asc" } },
-      deployments: { orderBy: [{ createdAt: "desc" }, { id: "desc" }], select: { id: true, commitSha: true, status: true, createdAt: true, queuedAt: true, healthyAt: true, stoppedAt: true } },
+      deployments: { orderBy: [{ createdAt: "desc" }, { id: "desc" }], select: { id: true, commitSha: true, status: true, createdAt: true, queuedAt: true, healthyAt: true, stoppedAt: true, imageTag: true, buildStartedAt: true, buildFinishedAt: true, startedAt: true, logs: { orderBy: { ts: "desc" }, take: 1, select: { ts: true } } } },
     } });
     if (!p) throw new ApiError(404, "Project not found");
-    return json({ project: { ...publicProject(p), environment_variables: p.environmentVariables.map(v => v.key), deployments: p.deployments.map(d => ({ id: d.id, commit_sha: d.commitSha, status: d.status, created_at: d.createdAt, queued_at: d.queuedAt, healthy_at: d.healthyAt, stopped_at: d.stoppedAt })) } });
+    return json({ project: { ...publicProject(p), environment_variables: p.environmentVariables.map(v => v.key), deployments: p.deployments.map(d => ({ id: d.id, commit_sha: d.commitSha, status: d.status, created_at: d.createdAt, queued_at: d.queuedAt, healthy_at: d.healthyAt, stopped_at: d.stoppedAt, image_tag: d.imageTag, build_started_at: d.buildStartedAt, build_finished_at: d.buildFinishedAt, started_at: d.startedAt, last_log_at: d.logs[0]?.ts ?? null })) } });
   });
 }
 export function patchProject(request: Request, id: string) {
