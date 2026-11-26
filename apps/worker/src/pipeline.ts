@@ -28,7 +28,7 @@ export async function buildPreparedDeployment(d: { id: string; projectId: string
     await transitionDeploymentStatus(d.id,"building","starting",{ imageTag, buildFinishedAt: new Date() });
   } catch (error) { await fail(d.id,phase,error,log); throw error; }
 }
-export async function processClaimedJob(job: ClaimedJob, docker: Docker, signal: AbortSignal, startRuntime?: (id: string) => Promise<void>) {
+export async function processClaimedJob(job: ClaimedJob, docker: Docker, signal: AbortSignal, startRuntime?: (id: string) => Promise<void>, checkout = clonePinnedRepository) {
   let log: BuildLogWriter | undefined;
   try {
     const d = await db.deployment.findUniqueOrThrow({ where: { id: job.deploymentId }, include: { project: true } });
@@ -40,7 +40,7 @@ export async function processClaimedJob(job: ClaimedJob, docker: Docker, signal:
     log = new BuildLogWriter(d.id,values);
     const writer = log;
     await withWorkspace(d.id,async workspace => {
-      await clonePinnedRepository(d.project.repoUrl,d.commitSha,workspace,writer,signal);
+      await checkout(d.project.repoUrl,d.commitSha,workspace,writer,signal);
       await buildPreparedDeployment(d,workspace,docker,writer,signal);
     });
     if(startRuntime)await startRuntime(d.id);
