@@ -1,168 +1,78 @@
 # DeployDeck
 
-Single-host PaaS foundation using Next.js App Router, TypeScript, PostgreSQL, Prisma, Docker Engine, and Caddy.
-
-## Current scope
-
-Phases 1 through 3 provide the foundation, authentication, project APIs, a durable deployment queue, pinned Git checkout, and real Docker image builds with persisted redacted logs. Container startup, health checks, deployment routing, rollback, and SSE are not implemented yet. Successful builds stop at `starting`; this does not mean the app is live.
+DeployDeck turns a public GitHub repository with a root Dockerfile into a running HTTP service on one Docker host. Use the dashboard to deploy a pinned commit, follow build and runtime logs, and switch back to a retained image. Each project has a stable Caddy URL. A failed build or startup health check leaves the previous healthy version serving.
 
 ## Start locally
 
-Install Docker Engine with Compose v2, or Docker Desktop using Linux containers. From the repository root:
+Use Linux or Ubuntu WSL with Docker Engine or Docker Desktop in Linux-container mode, Compose v2, and Node.js 22.12 or newer with npm. The host needs network access to GitHub and to the registries used by the Dockerfiles.
 
 ```sh
 npm run setup
-docker compose up --build
-```
-
-Run the setup once with Node.js 22.12 or newer to generate independent local session and encryption keys in an ignored `.env` file. Existing configuration is never overwritten. Open http://localhost:3000 or http://localhost:8080. PostgreSQL becomes healthy first, the web process applies migrations and starts, and the worker starts after web and proxy readiness. The worker verifies database connectivity, performs a real Docker Engine ping, and reads Caddy configuration through its Unix admin socket.
-
-```sh
+docker compose up --build -d
 docker compose ps
-docker compose logs worker
-curl --fail http://localhost:3000/api/health
-docker compose exec caddy caddy validate --config /etc/caddy/caddy.json
 ```
 
-Use `docker compose down` to stop. The database persists in a named volume. `docker compose down -v` deletes that data.
+Setup creates an ignored, owner-readable `.env` with independent random keys on first use. If configuring manually, copy `.env.example` to `.env` and fill both blank key fields with separately generated values. Setup preserves an existing file. Back up the encryption key with the database or stored project secrets will become unreadable.
 
-## Architecture and process boundaries
+| Setting | Purpose |
+| --- | --- |
+| `SESSION_SECRET`, `ENCRYPTION_KEY` | Each is 32 random bytes encoded as 64 hex characters. Generate each with `node -p "require('node:crypto').randomBytes(32).toString('hex')"`. |
+| `APP_ORIGIN` | Browser origin, default `http://localhost:3000`. Browser mutations check the supplied Origin header. HTTPS enables Secure session cookies. |
+| `BASE_DOMAIN`, `PUBLIC_PORT`, `PUBLIC_PROTOCOL` | Project URL defaults to `http://project-<id>.localhost:8080`. Custom domains require DNS and matching ingress configuration. |
+| `DATABASE_URL` | Host-side scripts use this connection string. Compose supplies an internal PostgreSQL URL to its services. |
+| `STARTUP_TIMEOUT`, `STALE_JOB_GRACE_MS`, `RECONCILE_INTERVAL_MS` | Worker startup health deadline, stale claim age and drift check interval. Defaults in milliseconds are 60000, 60000 and 15000. |
 
-- `apps/web`: control plane and UI. No Docker socket or Caddy admin socket is mounted here.
-- `apps/worker`: standalone daemon. It alone receives the Docker socket and the client mount of Caddy's admin socket. It polls PostgreSQL for build jobs and is the only process that builds Docker images.
-- `packages/db`: shared Prisma client, schema, and versioned SQL migrations.
-- `infra/caddy`: proxy configuration with a dedicated dynamic route insertion point (`project-routes`). Unknown project hosts return 404.
+1. Open [the dashboard](http://localhost:3000), create an account and select **New project**.
+2. Enter a public repository, branch, container port and HTTP health path. The app must listen on the configured port on all container interfaces. Add any runtime environment variables.
+3. Select **Deploy now**. The worker checks out the resolved commit and builds the root Dockerfile. The deployment page shows its status, timestamps and phase-filtered logs.
+4. Open the project URL after its health check succeeds. Use deployment history to roll back to a retained successful image or stop the active version.
 
-Caddy admin listens only on a Unix socket, never on a TCP port. Sharing the public ingress network with web therefore does not expose its admin API. PostgreSQL uses a private internal network and has no published port. Only localhost can reach the UI and proxy ports by default.
+`docker compose down` stops the platform services. The PostgreSQL volume persists. Project containers are managed by the worker and can be stopped through the dashboard before taking the platform down.
 
-The worker is a trusted host administrator because it holds the Docker socket. It runs as root for portable socket access in this local setup. The web process runs as an unprivileged user. This is a local development setup. Before public hosting, configure HTTPS, production database credentials, and a shared login rate limiter.
+## Architecture
 
-## Networking for the deployment pipeline
+| Component | Responsibility |
+| --- | --- |
+| Next.js web | Authenticates users, validates project configuration, records deployment requests and streams persisted logs. It receives neither the Docker socket nor Caddy's admin socket. |
+| PostgreSQL | Stores users, encrypted variables, projects, deployments, jobs and logs. Enqueue holds a project-row lock and writes the deployment and job in one transaction. A partial unique index enforces one in-flight deployment per project. |
+| Worker | Claims pending jobs using `FOR UPDATE SKIP LOCKED`. It owns Git checkout, Docker builds, runtime health checks, log capture and Caddy route updates. |
+| Caddy | Matches project hostnames to allocated host ports through `host.docker.internal`. Its admin API listens on a Unix socket in a volume shared with the worker. |
 
-The planned stable app URL is `http://project-<uuid>.localhost:8080`. `BASE_DOMAIN` and `PUBLIC_PORT` are configurable. The future worker must create the host match for that domain after a passing health check.
+| Event | State changes and effects |
+| --- | --- |
+| New deploy | `queued -> cloning -> building -> starting -> healthy`. The worker checks the container and its HTTP endpoint before replacing the project route and recording the active deployment. |
+| Build or startup failure | The candidate reaches `failed` with a reason. Failed startup containers are removed. |
+| Replacement or manual stop | The old deployment goes from `healthy -> stopping -> stopped`. The worker removes its container. Stopping the active deployment also removes its route. |
+| Rollback | A new job goes from `queued -> starting` with the source image tag and current project environment. It passes the normal health gate. Build timestamps stay null. A missing image fails the candidate. The retention policy keeps the five newest distinct successful tags and protects tags still referenced by containers. |
+| Restart or drift | Startup fails expired claimed builds or startups that lack a running container. Periodic reconciliation marks unexpectedly exited healthy deployments failed and logs orphan containers. Drift keeps the last route configuration, so a dead upstream can return a proxy error until a healthy version is deployed. |
 
-Inside the Caddy container, `localhost` refers to Caddy itself. Future upstreams must therefore use `host.docker.internal:<allocated-host-port>`, not `localhost:<port>`. Both worker and Caddy have the Linux host-gateway mapping. Published deployment ports must be reachable through that gateway; binding them only to host loopback will not work on Linux. Per-project networks, port allocation, resource limits, health checks, and firewall restrictions arrive with the real container pipeline.
+The worker handles SIGINT and SIGTERM, stops taking new work, drains or aborts the current operation, closes runtime log streams and disconnects from PostgreSQL.
 
-## Database guarantees
+## HTTP API
 
-Six application tables: users, projects, environment_variables, deployments, deployment_logs, deployment_jobs. Prisma adds its migration bookkeeping table.
+Authenticated endpoints use the `deploydeck_session` cookie. Missing or invalid sessions receive 401. Unknown and cross-user project or deployment IDs receive 404. Invalid inputs receive 422 with field details where available.
 
-The SQL migration supplements Prisma with CHECK constraints and a partial unique index limiting each project to one queued, cloning, building, or starting deployment. It also supplies a pending-job index. Deployment enqueue uses a transaction and a project-row lock; the worker claims pending jobs using `FOR UPDATE SKIP LOCKED` in a transaction that also changes queued to cloning.
-
-`deployments.created_at` is included because deployment history requires its descending index. Log IDs are bigint and must be serialized as strings in future JSON/SSE endpoints. Environment values use AES-256-GCM authenticated encryption.
-
-## Development and verification
-
-Node.js 22.12 or newer is required. Prisma 7.10.1 is pinned; its datasource URL lives in `prisma.config.ts` and the client uses the PostgreSQL driver adapter.
-
-```sh
-npm ci
-npm run db:generate
-npm run build
-npm run typecheck
-DATABASE_URL=postgresql://user:password@host:5432/database npm run db:validate
-```
-
-To apply migrations and run the database integration tests against a disposable PostgreSQL database:
-
-```sh
-DATABASE_URL=postgresql://user:password@host:5432/test_database npm run db:migrate
-DATABASE_URL=postgresql://user:password@host:5432/test_database npm run test:db
-```
-
-Tests create isolated UUID fixtures and remove their own rows. They cover foreign keys, status validation, unique env keys, job uniqueness, concurrent deployment insertion, and transaction rollback. They do not use a mocked database or Docker engine.
-
-For host-side web development, provide a reachable `DATABASE_URL`, build the shared package, then run `npm run dev`. Compose intentionally does not publish the database; use a separate local PostgreSQL instance or an explicit local-only Compose override.
-
-## Next phases
-
-1. Resource-limited containers, health gates, and Caddy route switching.
-2. Rollback, stop, crash recovery, and reconciliation.
-3. Deployment dashboard, SSE, and end-to-end failure tests.
-
-## Phase 2 API
-
-Auth responses include `user: { id, email, createdAt }`. Password hashes are never returned. Email addresses are trimmed and lowercased. Passwords require 12 characters minimum and 1024 UTF-8 bytes maximum. Sessions expire after seven days.
-
-| Method | Path | Behavior |
+| Method | Path | Result |
 | --- | --- | --- |
-| POST | /api/auth/signup | Create user, set session cookie, return 201; duplicate email 409 |
-| POST | /api/auth/login | Verify credentials, set session cookie, return 200; incorrect credentials 401 |
-| POST | /api/auth/logout | Clear cookie, return 200 |
-| GET | /api/auth/me | Current user or 401 |
-| POST | /api/projects | Validate public GitHub repo, create project and encrypted env rows atomically |
-| GET | /api/projects | Owned projects, latest deployment metadata, active URL or null |
-| GET | /api/projects/:id | Owned project, env keys only, newest-first deployment history |
-| PATCH | /api/projects/:id | Update branch, port, health path, and environment variables |
+| GET | `/api/health` | Database readiness |
+| POST | `/api/auth/signup`, `/api/auth/login`, `/api/auth/logout` | Create an account, establish a session or clear its cookie |
+| GET | `/api/auth/me` | Current user |
+| GET, POST | `/api/projects` | List owned projects or create a project |
+| GET, PATCH | `/api/projects/:id` | Read configuration and history or update branch, port, health path and environment variables |
+| GET, POST | `/api/projects/:id/deployments` | Read history or enqueue a build. Optional `commit_sha` accepts 7 to 40 hex characters. Creation returns 201, an in-flight conflict returns 409. |
+| GET | `/api/deployments/:id`, `/api/deployments/:id/health` | Deployment metadata or the worker's recorded health and routing state |
+| GET | `/api/deployments/:id/logs` | SSE history followed by live `log` and `status` events. Log IDs are decimal strings. `done` ends a failed or stopped stream. |
+| POST | `/api/deployments/:id/rollback`, `/api/deployments/:id/stop` | Enqueue image reuse or request a worker-managed stop. Accepted requests return 202. |
 
-All project routes require authentication. Missing projects and other users' projects return identical 404 responses. Project responses use snake_case fields. The list uses `latest_deployment: { id, status, created_at }` or null. Details return `environment_variables` as an array of keys. No endpoint returns plaintext or encrypted variable values. Project deletion is not part of Phase 2.
+Project creation accepts `name`, `repo_url`, `port`, optional `branch` (default `main`), `health_check_path` (default `/`) and an `environment_variables` key-value object. In a PATCH, omitted keys are preserved, strings set or replace values, and null removes a key. Project details return the keys with no stored values.
 
-Create request example:
+## Security model and MVP limits
 
-```json
-{
-  "name": "My app",
-  "repo_url": "https://github.com/owner/repository",
-  "branch": "main",
-  "port": 3000,
-  "health_check_path": "/health",
-  "environment_variables": { "API_TOKEN": "secret-value" }
-}
-```
+- Passwords use salted scrypt hashes. Sessions use signed, expiring HttpOnly cookies. Project variables use AES-256-GCM with project and key context. The worker redacts configured values from persisted build and runtime lines. The viewer renders text through React.
+- The web process uses an unprivileged user, dropped capabilities and no runtime administration mounts. The worker holds the Docker socket and must be trusted as a host administrator.
+- Repository input accepts public HTTPS GitHub owner/repository paths. Git uses argument arrays, pinned checkouts, disabled redirects and restricted protocols. Each build has a private per-deployment directory, removed in a finally block during normal or aborted execution. Clone and build deadlines are two and ten minutes.
+- Each app runs unprivileged with all capabilities dropped, no new privileges, no host binds, 256 MiB of memory, 0.5 CPU and a PID limit of 128. Each project uses its own Docker bridge. The worker checks for HTTP 2xx without following redirects.
+- Containers share the host kernel. Builds process user-controlled Dockerfiles and bridge networks have outbound access by default. Stronger tenant isolation with gVisor or Firecracker, egress policies and base-image vulnerability scanning are future work. The npm audit covers JavaScript dependencies.
+- Compose publishes the dashboard and Caddy on loopback. Deployed apps publish ports 20000-29999 on all host interfaces for gateway routing. Restrict those ports at the host firewall before exposing the machine. Compose ships local database credentials and HTTP defaults.
 
-PATCH accepts only `branch`, `port`, `health_check_path`, and `environment_variables`. Omitted variables remain unchanged, string values create or replace a variable, and null deletes it. Empty strings are valid values. Unknown fields are rejected. Mutations use JSON bodies limited to 128 KiB. Validation failures return 422 with a `fields` object when field-specific. Repository HEAD checks use a five-second timeout and reject redirects, non-200 responses, and network errors.
-
-### Session and encryption configuration
-
-- `SESSION_SECRET`: independent 32-byte random key as 64 hex characters. Rotating it invalidates all sessions.
-- `ENCRYPTION_KEY`: independent 32-byte random key as 64 hex characters. Back it up securely; changing it without migrating existing ciphertext makes stored variables unreadable.
-- `APP_ORIGIN`: exact browser origin, such as `http://localhost:3000`. Use `http://localhost:8080` when accessing the control plane through Caddy. Browser writes from other origins are rejected. HTTPS sets Secure cookies; localhost HTTP is supported for development. Without APP_ORIGIN, production cookies default to Secure.
-- `PUBLIC_PROTOCOL`: optional `http` or `https` scheme for generated deployment URLs (default http). Base domain and port retain the foundation defaults.
-
-Cookies are HTTP-only, host-only, SameSite=Lax and signed with HMAC-SHA256. Do not reuse session keys for encryption. Logout clears the browser cookie; a previously copied stateless cookie remains valid until expiry or key rotation. Per-session server-side revocation is not implemented. Web never decrypts stored project values on its read paths. Encryption helpers are shared through `packages/db`; only the worker decrypts environment values during build processing, for log redaction. Ciphertext is versioned and authenticates the project UUID and variable key as additional data.
-
-### Phase 2 tests
-
-```sh
-npm run test:security
-DATABASE_URL=postgresql://user:password@host:5432/test_database npm test
-```
-
-The suite uses real PostgreSQL for persistence, uniqueness, transactions, and ownership tests. API integration tests invoke the route handlers with real Request/Response objects. Only outbound GitHub API and HEAD responses are stubbed for deterministic success, redirect, and failure scenarios; production code always performs the real HEAD request. Docker builds and statuses are never mocked. CI runs these tests, the production build, and Docker Compose startup. Authentication has no UI yet; the dashboard arrives in a later phase.
-
-## Phase 3 deployment API and worker
-
-| Method | Path | Behavior |
-| --- | --- | --- |
-| POST | /api/projects/:id/deployments | Resolve an immutable commit and atomically enqueue; 201 with deployment_id and queued status |
-| GET | /api/projects/:id/deployments | Owned project history, newest first |
-| GET | /api/deployments/:id | Owned deployment metadata, build timestamps, failure reason and stable project_url |
-
-POST accepts `{}` or `{ "commit_sha": "abcdef1" }`. An omitted body is also allowed. A supplied SHA must contain 7 to 40 hexadecimal characters. Both short SHAs and branch names are resolved through GitHub's commit API to a full 40-character SHA. A short prefix that does not match the resolved commit is rejected. Missing or inaccessible refs, GitHub rate limits and network errors return 422 without creating queue rows. Requests require session authentication and ownership; cross-user access returns 404. An existing queued, cloning, building, or starting deployment returns 409.
-
-The project URL is a stable derived address, not evidence that this build is serving requests. Phase 3 does not change Caddy routes or active_deployment_id.
-
-### Build stages
-
-1. Claim the oldest pending job with SKIP LOCKED. Store worker identity and database claim time; transition queued to cloning in the same transaction.
-2. Decrypt environment values in worker memory using the project UUID and key as authenticated encryption context. Never pass these values as Docker build arguments or Git subprocess environment variables.
-3. Create an exclusive `/tmp/deploydeck/<deployment_id>/` directory. Run parameterized Git commands with prompts, global config, hooks, non-HTTPS protocols and redirects disabled. Checkout the exact SHA and verify HEAD. The combined clone/checkout budget is two minutes.
-4. Check for a regular root Dockerfile. Missing Dockerfiles fail with `Missing Dockerfile in repository root` before any build request. Repository submodules are not initialized.
-5. Transition to building and set build_started_at. Upload a tar context through dockerode, respecting .dockerignore, always excluding .git, and never dereferencing symlinks. Run the Docker Engine classic builder with a ten-minute deadline, 256 MiB memory and 0.5 CPU build limits. The host must support the classic builder API (`version=1`); BuildKit-only hosts are not supported in this phase.
-6. Parse real Engine JSON output incrementally and await log inserts for backpressure. Redact non-empty environment values, including values split across output chunks. Multiline values also redact their individual non-empty lines. Oversized output records or lines fail safely rather than consuming unbounded memory. Failure reasons are redacted too.
-7. Require a Docker success record and verify the resulting image ID through the Engine image listing. Save `deploydeck/<project_id>:<first-12-SHA-characters>`, build_finished_at, and starting status. This is the Phase 4 handoff.
-8. Always remove an owned workspace in finally, and mark the claimed job done in the polling loop's finally block. SIGTERM/SIGINT stops new claims, kills active Git process groups or aborts active Docker requests, records the failure when possible, and cleans up.
-
-Every status transition uses an expected prior status in its UPDATE predicate. Invalid transitions and stale workers cannot overwrite newer state. Phase 3 accepts only queued -> cloning -> building -> starting, plus failure from cloning/building. Failed deployments cannot transition again.
-
-A successful Phase 3 build stays at starting with a done job and blocks another deployment for that project. Phase 4 must continue those persisted image candidates or call the runtime stage immediately after `buildPreparedDeployment`. No container is started in this phase. Crash recovery for SIGKILL or host failure, retention policies, disk quotas, and build-network egress restrictions remain future work. A clean shutdown cannot guarantee daemon-side cancellation during a network partition; reconciliation will handle orphaned resources later.
-
-### Verify real builds
-
-```sh
-DATABASE_URL=postgresql://user:password@host:5432/test_database npm run db:migrate
-DATABASE_URL=postgresql://user:password@host:5432/test_database npm test
-REQUIRE_DOCKER_TESTS=1 DATABASE_URL=postgresql://user:password@host:5432/test_database npm run test:worker
-```
-
-The full suite runs files sequentially because queue tests deliberately claim globally pending jobs. Use a disposable test database with no running worker. Real Docker tests build a network-independent FROM scratch fixture, verify the image exists, check error redaction with a failing COPY, and exercise cancellation. They remove their images afterward. Without a Docker socket this test reports an explicit skip; `REQUIRE_DOCKER_TESTS=1` turns missing Docker into failure and is mandatory in CI. Docker operations and build logs are never mocked. `DOCKER_SOCKET` defaults to `/var/run/docker.sock`.
+See [Verification and live demo](VERIFICATION.md) for the reproducible test environment and operator checks.
