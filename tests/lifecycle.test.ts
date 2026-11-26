@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
-import { cp, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { appendFile, cp, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { get } from "node:http";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -15,6 +15,14 @@ import { claimNextJob, finishJob } from "../apps/worker/src/queue";
 import { runDeployment } from "../apps/worker/src/runtime";
 import { RuntimeLogs } from "../apps/worker/src/runtime-logs";
 
+import { POST as rollback } from "../apps/web/app/api/deployments/[id]/rollback/route";
+import { POST as stop } from "../apps/web/app/api/deployments/[id]/stop/route";
+import { signSession } from "../apps/web/lib/security";
+import { processStops } from "../apps/worker/src/stop";
+import { recoverStaleJobs, reconcileDrift } from "../apps/worker/src/reconcile";
+import { setTimeout as delay } from "node:timers/promises";
+
+process.env.SESSION_SECRET = randomBytes(32).toString("hex");
 const exec = promisify(execFile);
 const docker = new Docker({ socketPath: process.env.DOCKER_SOCKET ?? "/var/run/docker.sock" });
 const logs = new RuntimeLogs(docker);
@@ -40,7 +48,7 @@ before(async () => {
   const config = JSON.parse(await readFile("infra/caddy/caddy.json", "utf8"));
   config.admin.listen = "unix/" + join(root, "admin.sock");
   config.apps.http.servers.deploydeck.listen = ["unix/" + join(root, "ingress.sock")];
-  caddy = new CaddyClient(undefined, join(root, "admin.sock"));
+  caddy = new CaddyClient("", join(root, "admin.sock"));
   await writeFile(join(root, "config.json"), JSON.stringify(config));
   await new Promise<void>((accept, reject) => {
     const launcher = spawn(join(root, "caddy"), ["start", "--config", join(root, "config.json")], {
@@ -89,9 +97,10 @@ after(async () => {
   }
 });
 
-async function deploy(fixture = "lifecycle-http") {
+async function deploy(fixture = "lifecycle-http", version?: "v1" | "v2") {
   const repo = await mkdtemp(join(root, "repo-"));
   await cp(resolve("tests/fixtures", fixture), repo, { recursive: true });
+  if (version) await appendFile(join(repo, "Dockerfile"), "\nENV APP_VERSION=" + version + "\n");
   const git = (...args: string[]) => exec("git", ["-C", repo, ...args]);
   await git("init", "--quiet");
   await git("add", ".");
@@ -240,4 +249,195 @@ test("replacement stops v1 and keeps only the five newest successful image tags"
   }
   await assert.rejects(docker.getImage(versions[0].imageTag!).inspect(), { statusCode: 404 });
   for (const recent of versions.slice(1)) await docker.getImage(recent.imageTag!).inspect();
+});
+
+function post(action: typeof rollback, id: string, user: string | null = userId) {
+  const url = "http://localhost/api/deployments/" + id + (action === rollback ? "/rollback" : "/stop");
+  return action(new Request(url, { method: "POST", headers: user ? { cookie: "deploydeck_session=" + signSession(user) } : {} }),
+    { params: Promise.resolve({ id }) });
+}
+
+async function twoVersions() {
+  const first = await deploy("lifecycle-http", "v1");
+  await assertServing(first.id, "v1");
+  const second = await deploy("lifecycle-http", "v2");
+  await assertServing(second.id, "v2");
+  return { first, second };
+}
+
+async function queueRollback(target: { id: string; imageTag: string | null; commitSha: string }) {
+  const response = await post(rollback, target.id);
+  assert.equal(response.status, 202);
+  const body = await response.json();
+  assert.deepEqual(body, { deployment_id: body.deployment_id, status: "queued", source: "rollback", from_image: target.imageTag });
+  const row = await db.deployment.findUniqueOrThrow({ where: { id: body.deployment_id }, include: { job: true } });
+  assert.equal(row.projectId, projectId);
+  assert.equal(row.commitSha, target.commitSha);
+  assert.equal(row.imageTag, target.imageTag);
+  assert.equal(row.job?.status, "pending");
+  return row.id;
+}
+
+async function runRollback(id: string) {
+  const job = await claimNextJob(userId);
+  assert(job && job.deploymentId === id);
+  const signal = new AbortController().signal;
+  await processClaimedJob(job, docker, signal, next => runDeployment(next, docker, caddy, logs, signal));
+  await finishJob(job);
+  const row = await db.deployment.findUniqueOrThrow({ where: { id } });
+  assert.equal(row.buildStartedAt, null);
+  assert.equal(row.buildFinishedAt, null);
+  return row;
+}
+
+test("rollback reuses the retained v1 image and switches traffic back from v2", async () => {
+  const { first } = await twoVersions();
+  const id = await queueRollback(first);
+  assert.equal((await post(rollback, first.id)).status, 409);
+  const rolled = await runRollback(id);
+  assert.equal(rolled.status, "healthy", rolled.failureReason ?? undefined);
+  const info = await docker.getContainer("dd-" + id).inspect();
+  assert.equal(info.Image, (await docker.getImage(first.imageTag!).inspect()).Id);
+  await assertServing(id, "v1");
+});
+
+test("an unhealthy rollback removes its container and keeps v2 serving", async () => {
+  const { first, second } = await twoVersions();
+  await setVariable("FIXTURE_MODE", "unhealthy");
+  const rolled = await runRollback(await queueRollback(first));
+  assert.equal(rolled.status, "failed");
+  assert.match(rolled.failureReason ?? "", /HTTP 503/);
+  await assert.rejects(docker.getContainer("dd-" + rolled.id).inspect(), { statusCode: 404 });
+  await assertServing(second.id, "v2");
+});
+
+test("a pruned rollback image fails before startup and preserves v2", async () => {
+  const { first, second } = await twoVersions();
+  await docker.getImage(first.imageTag!).remove();
+  const rolled = await runRollback(await queueRollback(first));
+  assert.equal(rolled.status, "failed");
+  assert.equal(rolled.failureReason, "Rollback image no longer exists locally");
+  assert.equal(rolled.startedAt, null);
+  await assertServing(second.id, "v2");
+});
+
+test("manual stop retires the route and removes the container", async () => {
+  const live = await deploy();
+  await assertServing(live.id, "v1");
+  const response = await post(stop, live.id);
+  assert.equal(response.status, 202);
+  assert.deepEqual(await response.json(), { deployment_id: live.id, status: "stopping" });
+  assert.equal((await post(stop, live.id)).status, 409);
+  await processStops(docker, caddy, logs);
+  const row = await db.deployment.findUniqueOrThrow({ where: { id: live.id }, include: { project: true } });
+  assert.equal(row.status, "stopped");
+  assert(row.stoppedAt);
+  assert.equal(row.project.activeDeploymentId, null);
+  assert.equal(await caddy.projectRoute(projectId), null);
+  await assert.rejects(docker.getContainer("dd-" + row.id).inspect(), { statusCode: 404 });
+});
+
+test("deployment controls enforce session, ownership and rollback eligibility", async () => {
+  const other = randomUUID();
+  await db.user.create({ data: { id: other, email: other + "@test.dev", passwordHash: "fixture" } });
+  try {
+    const row = await db.deployment.create({ data: { projectId, status: "failed", commitSha: "a".repeat(40) } });
+    for (const action of [rollback, stop]) {
+      assert.equal((await post(action, row.id, null)).status, 401);
+      assert.equal((await post(action, row.id, other)).status, 404);
+      assert.equal((await post(action, randomUUID())).status, 404);
+    }
+    assert.equal((await post(rollback, row.id)).status, 422);
+    assert.equal((await post(stop, row.id)).status, 409);
+    await db.deployment.update({ where: { id: row.id }, data: { status: "stopped", healthyAt: new Date() } });
+    assert.equal((await post(rollback, row.id)).status, 422);
+  } finally { await db.user.delete({ where: { id: other } }); }
+});
+
+test("startup recovers expired claims and preserves recent jobs", async () => {
+  const row = await db.deployment.create({ data: { projectId, status: "building", commitSha: "a".repeat(40),
+    job: { create: { status: "claimed", claimedAt: new Date() } } } });
+  await recoverStaleJobs(docker);
+  assert.equal((await db.deployment.findUniqueOrThrow({ where: { id: row.id } })).status, "building");
+  await db.deploymentJob.update({ where: { deploymentId: row.id }, data: { claimedAt: new Date(Date.now() - 120000) } });
+  await recoverStaleJobs(docker);
+  const failed = await db.deployment.findUniqueOrThrow({ where: { id: row.id }, include: { job: true } });
+  assert.equal(failed.status, "failed");
+  assert.equal(failed.failureReason, "worker restarted mid-deployment");
+  assert.equal(failed.job?.status, "done");
+});
+
+test("external container death records drift and preserves the existing Caddy route", async () => {
+  const live = await deploy();
+  await assertServing(live.id, "v1");
+  const route = await caddy.projectRoute(projectId);
+  assert(route);
+  const container = docker.getContainer("dd-" + live.id);
+  await container.kill();
+  await container.wait();
+  await reconcileDrift(docker);
+  const row = await db.deployment.findUniqueOrThrow({ where: { id: live.id } });
+  assert.equal(row.status, "failed");
+  assert.equal(row.failureReason, "container exited unexpectedly");
+  assert.deepEqual(await caddy.projectRoute(projectId), route);
+});
+
+test("worker signals drain a starting rollback and exit cleanly", async () => {
+  const live = await deploy();
+  await assertServing(live.id, "v1");
+  await setVariable("FIXTURE_MODE", "timeout");
+  const candidate = await queueRollback(live);
+  for (const signal of ["SIGTERM", "SIGINT"] as const) {
+    const child = spawn(process.execPath, ["--import", "tsx", "apps/worker/src/index.ts"], {
+      env: { ...process.env, CADDY_ADMIN_SOCKET: join(root, "admin.sock"), CADDY_ADMIN_URL: "", STARTUP_TIMEOUT: "60000" },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let output = "";
+    child.stdout.on("data", chunk => { output += chunk; });
+    child.stderr.on("data", chunk => { output += chunk; });
+    const exited = new Promise<number | null>((accept, reject) => {
+      child.once("error", reject).once("exit", accept);
+    });
+    try {
+      const deadline = Date.now() + 45000;
+      while (true) {
+        assert.equal(child.exitCode, null, output);
+        const row = await db.deployment.findUniqueOrThrow({ where: { id: candidate } });
+        if (output.includes("Worker ready") && (signal === "SIGINT" || row.containerId)) break;
+        assert(Date.now() < deadline, "Worker did not reach expected state: " + output);
+        await delay(100);
+      }
+      child.kill(signal);
+      const timeout = AbortSignal.timeout(30000);
+      const overdue = new Promise<never>((_, reject) => timeout.addEventListener("abort", () => reject(new Error("Worker shutdown timed out")), { once: true }));
+      assert.equal(await Promise.race([exited, overdue]), 0, output);
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+      await exited;
+    }
+  }
+  const row = await db.deployment.findUniqueOrThrow({ where: { id: candidate }, include: { job: true } });
+  assert.equal(row.status, "failed");
+  assert.equal(row.job?.status, "done");
+  await assert.rejects(docker.getContainer("dd-" + candidate).inspect(), { statusCode: 404 });
+  await assertServing(live.id, "v1");
+});
+
+test("recovery preserves a running startup container and drift reports it if orphaned", async t => {
+  const row = await db.deployment.create({ data: { projectId, status: "starting", commitSha: "b".repeat(40),
+    job: { create: { status: "claimed", claimedAt: new Date(Date.now() - 120000) } } } });
+  const name = "dd-" + row.id;
+  const container = await docker.createContainer({
+    name, Image: "node:22-bookworm-slim", Cmd: ["sleep", "300"], Labels: { "deploydeck.project": projectId },
+  });
+  await container.start();
+  await recoverStaleJobs(docker);
+  const current = await db.deployment.findUniqueOrThrow({ where: { id: row.id }, include: { job: true } });
+  assert.equal(current.status, "starting");
+  assert.equal(current.job?.status, "claimed");
+  await db.deployment.delete({ where: { id: row.id } });
+  const warnings = t.mock.method(console, "warn");
+  await reconcileDrift(docker);
+  assert(warnings.mock.calls.some(call => String(call.arguments[0]).includes("orphaned running container " + name)));
+  assert((await container.inspect()).State.Running);
 });
