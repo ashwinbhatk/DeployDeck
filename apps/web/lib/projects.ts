@@ -12,7 +12,7 @@ const projectSelect = {
 type Project = Prisma.ProjectGetPayload<{ select: typeof projectSelect }>;
 function publicProject(p: Project) {
   return { id: p.id, name: p.name, repo_url: p.repoUrl, branch: p.branch, port: p.port,
-    health_check_path: p.healthCheckPath, active_deployment_id: p.activeDeploymentId, created_at: p.createdAt,
+    health_check_path: p.healthCheckPath, active_deployment_id: p.activeDeploymentId, project_url: projectUrl(p.id), created_at: p.createdAt,
     active_url: p.activeDeployment?.status === "healthy" ? `${process.env.PUBLIC_PROTOCOL ?? "http"}://project-${p.id}.${process.env.BASE_DOMAIN ?? "localhost"}:${process.env.PUBLIC_PORT ?? "8080"}` : null };
 }
 export function validId(id: string) {
