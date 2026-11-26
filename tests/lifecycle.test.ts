@@ -8,7 +8,7 @@ import { join, resolve } from "node:path";
 import { after, afterEach, before, beforeEach, test } from "node:test";
 import { promisify } from "node:util";
 import Docker from "dockerode";
-import { db } from "@deploydeck/db";
+import { db, encryptValue } from "@deploydeck/db";
 import { CaddyClient } from "../apps/worker/src/caddy";
 import { processClaimedJob } from "../apps/worker/src/pipeline";
 import { claimNextJob, finishJob } from "../apps/worker/src/queue";
@@ -147,4 +147,40 @@ test("healthy deployment enforces container limits and serves v1 through Caddy",
   assert(row.hostPort && row.hostPort >= 20000 && row.hostPort <= 29999);
   assert.equal(info.NetworkSettings.Ports["3000/tcp"]?.[0].HostPort, String(row.hostPort));
   await assertServing(row.id, "v1");
+});
+
+async function setVariable(key: string, value: string) {
+  const valueEncrypted = encryptValue(value, projectId + ":" + key);
+  await db.environmentVariable.upsert({
+    where: { projectId_key: { projectId, key } },
+    create: { projectId, key, valueEncrypted }, update: { valueEncrypted },
+  });
+}
+
+test("failed build, unhealthy response, timeout and crash preserve the live deployment", async () => {
+  const live = await deploy();
+  await assertServing(live.id, "v1");
+  const broken = await deploy("lifecycle-build-failure");
+  assert.equal(broken.status, "failed");
+  assert.match(broken.failureReason ?? "", /deliberately-missing-lifecycle-file/);
+  assert(broken.buildStartedAt && broken.buildFinishedAt);
+  assert.equal(broken.imageTag, null);
+  await assertServing(live.id, "v1");
+
+  const failures = [
+    ["unhealthy", /health check returned HTTP 503/],
+    ["timeout", /^health check \[REDACTED\]$/],
+    ["exit", /^container \[REDACTED\]ed with code 42$/],
+  ] as const;
+  for (const [mode, reason] of failures) {
+    await setVariable("FIXTURE_MODE", mode);
+    const failed = await deploy();
+    assert(failed.imageTag && failed.buildFinishedAt);
+    assert.equal(failed.status, "failed");
+    assert.match(failed.failureReason ?? "", reason);
+    assert.equal(failed.containerId, null);
+    assert.equal(failed.hostPort, null);
+    await assert.rejects(docker.getContainer("dd-" + failed.id).inspect(), { statusCode: 404 });
+    await assertServing(live.id, "v1");
+  }
 });
