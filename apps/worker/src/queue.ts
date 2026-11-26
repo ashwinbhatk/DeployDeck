@@ -19,9 +19,11 @@ export async function finishJob(job: ClaimedJob) {
   const result = await db.deploymentJob.updateMany({ where: { id: job.id, status: "claimed", claimedBy: job.workerId }, data: { status: "done" } });
   if (result.count !== 1) throw new Error("Job ownership changed before completion");
 }
-export async function runWorkerLoop(workerId: string, signal: AbortSignal, processJob: (job: ClaimedJob) => Promise<void>) {
+export async function runWorkerLoop(workerId: string, signal: AbortSignal, processJob: (job: ClaimedJob) => Promise<void>, maintenance?: () => Promise<void>) {
   while (!signal.aborted) {
-    const job = await claimNextJob(workerId) ?? await claimPreparedJob(workerId);
+    await maintenance?.();
+    if (signal.aborted) break;
+    const job = await claimNextJob(workerId) ?? (signal.aborted ? null : await claimPreparedJob(workerId));
     if (!job) {
       await delay(1000, undefined, { signal }).catch(error => { if (!signal.aborted) throw error; });
       continue;

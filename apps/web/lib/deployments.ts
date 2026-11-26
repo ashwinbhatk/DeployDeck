@@ -101,3 +101,16 @@ export function rollbackDeployment(request: Request, id: string) {
     });
   });
 }
+
+export function stopDeployment(request: Request, id: string) {
+  return api(async () => {
+    const user = await requireUser(request);
+    return db.$transaction(async tx => {
+      await lockedDeployment(tx, id, user.id);
+      checkOrigin(request);
+      const changed = await tx.deployment.updateMany({ where: { id, status: "healthy" }, data: { status: "stopping" } });
+      if (!changed.count) throw new ApiError(409, "Deployment is not healthy");
+      return json({ deployment_id: id, status: "stopping" }, 202);
+    });
+  });
+}

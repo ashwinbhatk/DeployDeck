@@ -5,6 +5,7 @@ import { runWorkerLoop } from "./queue";
 import { processClaimedJob } from "./pipeline";
 import { CaddyClient } from "./caddy";
 import { RuntimeLogs } from "./runtime-logs";
+import { processStops } from "./stop";
 import { runDeployment } from "./runtime";
 const abort=new AbortController();
 for(const signal of ["SIGINT","SIGTERM"] as const)process.once(signal,()=>abort.abort());
@@ -23,7 +24,7 @@ async function main() {
       if(info.State.Running)await logs.attach(d.id,d.containerId!,info.Config.Env.map(v=>v.slice(v.indexOf("=")+1)));
     }
     console.info("Worker ready to build and start deployments.");
-    await runWorkerLoop(randomUUID(),abort.signal,job=>processClaimedJob(job,streamingDocker,abort.signal,id=>runDeployment(id,docker,caddy,logs,abort.signal)));
+    await runWorkerLoop(randomUUID(),abort.signal,job=>processClaimedJob(job,streamingDocker,abort.signal,id=>runDeployment(id,docker,caddy,logs,abort.signal)),()=>processStops(docker,caddy,logs));
   }finally{await logs.stopAll();}
 }
 main().catch(()=>{console.error("Worker failed: verify database, Docker, and Caddy connectivity.");process.exitCode=1;}).finally(()=>db.$disconnect());

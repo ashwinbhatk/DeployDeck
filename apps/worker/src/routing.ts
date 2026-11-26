@@ -3,7 +3,8 @@ import type Docker from "dockerode";
 import { CaddyClient, routeFor, type Route } from "./caddy";
 import { transitionDeploymentStatus } from "./state";
 import { checkHttp } from "./health";
-import { containerHost, removeContainer, isDockerError } from "./containers";
+import { containerHost, isDockerError } from "./containers";
+import { completeStop } from "./stop";
 import type { RuntimeLogs } from "./runtime-logs";
 import type { BuildLogWriter } from "./logs";
 export class RoutingUncertainError extends Error {}
@@ -36,7 +37,7 @@ export async function promoteDeployment(id:string,docker:Docker,caddy:CaddyClien
     throw error;
   }
 }
-export async function cleanupSuperseded(projectId:string,priorIds:string[],docker:Docker,logs:RuntimeLogs,log:BuildLogWriter) {
+export async function cleanupSuperseded(projectId:string,priorIds:string[],docker:Docker,caddy:CaddyClient,logs:RuntimeLogs,log:BuildLogWriter) {
   for(const id of priorIds){
     try {
       const d=await db.$transaction(async tx=>{
@@ -48,12 +49,7 @@ export async function cleanupSuperseded(projectId:string,priorIds:string[],docke
         return old;
       });
       if(!d)continue;
-      if(d.containerId)await removeContainer(docker.getContainer(d.containerId));
-      await logs.stop(id).catch(()=>{});
-      await db.$transaction(async tx=>{
-        await tx.deployment.updateMany({where:{id,status:"stopping"},data:{containerId:null,hostPort:null}});
-        await transitionDeploymentStatus(id,"stopping","stopped",{stoppedAt:new Date()},tx);
-      });
+      await completeStop(id,projectId,docker,caddy,logs);
     }catch{await log.write(`Superseded container cleanup pending for ${id}\n`);}
   }
 }

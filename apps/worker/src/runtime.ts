@@ -22,7 +22,7 @@ export async function runDeployment(id:string,docker:Docker,caddy:CaddyClient,lo
     const previous=await promoteDeployment(id,docker,caddy,signal);
     promoted=true;
     await log.write("Container healthy and route activated\n");
-    await cleanupSuperseded(d.projectId,previous,docker,logs,log);
+    await cleanupSuperseded(d.projectId,previous,docker,caddy,logs,log);
     await retainRecentImages(d.projectId,docker);
   }catch(error){
     if(promoted){await log.write("Deployment remains active; post-promotion maintenance needs retry\n");}
