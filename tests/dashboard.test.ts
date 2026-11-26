@@ -1,9 +1,7 @@
 import assert from "node:assert/strict";
 import { randomBytes, randomUUID } from "node:crypto";
-import { spawn, type ChildProcess } from "node:child_process";
-import { once } from "node:events";
+import { startWebServer } from "./helpers/web-server";
 import { after, before, test } from "node:test";
-import { setTimeout as delay } from "node:timers/promises";
 import { db } from "@deploydeck/db";
 import { signSession } from "../apps/web/lib/security";
 import { GET as openStream } from "../apps/web/app/api/deployments/[id]/logs/route";
@@ -12,29 +10,17 @@ const owner = randomUUID(), other = randomUUID(), project = randomUUID();
 const email = owner + "@test.dev";
 process.env.SESSION_SECRET = randomBytes(32).toString("hex");
 const cookie = (user = owner) => "deploydeck_session=" + signSession(user);
-let server: ChildProcess;
+let server: Awaited<ReturnType<typeof startWebServer>>;
 let origin = "";
-let exited: Promise<unknown>;
 
 before(async () => {
   await db.user.createMany({ data: [owner, other].map(id => ({ id, email: id + "@test.dev", passwordHash: "fixture" })) });
   await db.project.create({ data: { id: project, userId: owner, name: "Dashboard", repoUrl: "https://github.com/example/repo", port: 3000 } });
-  server = spawn(process.execPath, ["node_modules/next/dist/bin/next", "start", "apps/web", "-H", "127.0.0.1", "-p", "0"],
-    { stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, FORCE_COLOR: "0" } });
-  exited = once(server, "exit");
-  let output = "";
-  server.stdout!.on("data", chunk => { output += chunk; });
-  server.stderr!.on("data", chunk => { output += chunk; });
-  const until = Date.now() + 30000;
-  while (!origin) {
-    assert(server.exitCode === null && Date.now() < until, "Next startup failed: " + output);
-    origin = output.match(/http:\/\/127\.0\.0\.1:\d+/)?.[0] ?? "";
-    await delay(50);
-  }
+  server = await startWebServer();
+  origin = server.origin;
 });
 after(async () => {
-  if (server && server.exitCode === null && server.signalCode === null) server.kill("SIGTERM");
-  await exited;
+  await server?.close();
   await db.deployment.deleteMany({ where: { projectId: project } });
   await db.project.deleteMany({ where: { id: project } });
   await db.user.deleteMany({ where: { id: { in: [owner, other] } } });

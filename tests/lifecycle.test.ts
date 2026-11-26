@@ -9,6 +9,7 @@ import { after, afterEach, before, beforeEach, test } from "node:test";
 import { promisify } from "node:util";
 import Docker from "dockerode";
 import { db, encryptValue } from "@deploydeck/db";
+import { startWebServer } from "./helpers/web-server";
 import { CaddyClient } from "../apps/worker/src/caddy";
 import { processClaimedJob } from "../apps/worker/src/pipeline";
 import { claimNextJob, finishJob } from "../apps/worker/src/queue";
@@ -27,6 +28,7 @@ const exec = promisify(execFile);
 const docker = new Docker({ socketPath: process.env.DOCKER_SOCKET ?? "/var/run/docker.sock" });
 const logs = new RuntimeLogs(docker);
 const userId = randomUUID();
+const acceptanceEmail = randomUUID() + "@test.dev";
 let root: string;
 let caddy: CaddyClient;
 let projectId: string;
@@ -90,7 +92,7 @@ afterEach(async () => {
 after(async () => {
   try {
     if (caddyStarted) await exec(join(root, "caddy"), ["stop", "--address", "unix/" + join(root, "admin.sock")]);
-    await db.user.deleteMany({ where: { id: userId } });
+    await db.user.deleteMany({ where: { OR: [{ id: userId }, { email: acceptanceEmail }] } });
   } finally {
     await db.$disconnect();
     if (root) await rm(root, { recursive: true, force: true });
@@ -440,4 +442,79 @@ test("recovery preserves a running startup container and drift reports it if orp
   await reconcileDrift(docker);
   assert(warnings.mock.calls.some(call => String(call.arguments[0]).includes("orphaned running container " + name)));
   assert((await container.inspect()).State.Running);
+});
+
+test("HTTP signup, concurrent deploy, replacement, failed build, rollback and stop", async t => {
+  // This journey creates its own project via HTTP instead of the suite's seeded project.
+  await db.project.delete({ where: { id: projectId } });
+  const repo = await mkdtemp(join(root, "acceptance-"));
+  const git = (...args: string[]) => exec("git", ["-C", repo, ...args]);
+  await git("init", "-q", "-b", "main");
+  await cp(resolve("tests/fixtures/lifecycle-http"), repo, { recursive: true });
+  async function commit(message: string) {
+    await git("add", ".");
+    await git("-c", "user.name=Ashwin Bhat K", "-c", "user.email=ashwinbhatk00@gmail.com", "commit", "-qm", message);
+    return (await git("rev-parse", "HEAD")).stdout.trim();
+  }
+  const firstSha = await commit("Serve v1");
+  await appendFile(join(repo, "Dockerfile"), "\nENV APP_VERSION=v2\n");
+  const nextSha = await commit("Serve v2");
+  await cp(resolve("tests/fixtures/lifecycle-build-failure/Dockerfile"), join(repo, "Dockerfile"));
+  const brokenSha = await commit("Exercise build failure");
+
+  const web = await startWebServer({ ACCEPTANCE_REPO: repo }, ["--require", resolve("tests/helpers/github-fixture.cjs")]);
+  t.after(web.close);
+  let cookie = "";
+  const post = (path: string, data = {}) => fetch(web.origin + "/api/" + path, {
+    method: "POST", headers: { cookie, "content-type": "application/json" }, body: JSON.stringify(data),
+  });
+  const signup = await post("auth/signup", { email: acceptanceEmail, password: randomUUID() });
+  assert.equal(signup.status, 201);
+  cookie = signup.headers.get("set-cookie")!.split(";")[0];
+  const created = await post("projects", { name: "Acceptance", repo_url: "https://github.com/example/acceptance", port: 3000, health_check_path: "/health" });
+  assert.equal(created.status, 201);
+  projectId = (await created.json()).project.id;
+  const trigger = (commit_sha: string) => post("projects/" + projectId + "/deployments", { commit_sha });
+  async function processResponse(response: Response, sha: string, status = 201) {
+    assert.equal(response.status, status);
+    const { deployment_id: id } = await response.json();
+    tags.add("deploydeck/" + projectId + ":" + sha.slice(0, 12));
+    const job = await claimNextJob(userId);
+    assert(job && job.deploymentId === id);
+    const signal = new AbortController().signal;
+    await processClaimedJob(job, docker, signal, next => runDeployment(next, docker, caddy, logs, signal),
+      async (_url, pinned, workspace) => {
+        assert.equal(pinned, sha);
+        await exec("git", ["clone", "--no-checkout", "--", repo, workspace]);
+        await exec("git", ["-C", workspace, "checkout", "--detach", pinned]);
+      });
+    await finishJob(job);
+    return db.deployment.findUniqueOrThrow({ where: { id } });
+  }
+  const responses = await Promise.all([trigger(firstSha), trigger(firstSha)]);
+  assert.deepEqual(responses.map(r => r.status).sort(), [201, 409]);
+  assert.equal(await db.deploymentJob.count({ where: { deployment: { projectId } } }), 1);
+  const first = await processResponse(responses.find(r => r.status === 201)!, firstSha);
+  assert.equal(first.status, "healthy");
+  await assertServing(first.id, "v1");
+  const next = await processResponse(await trigger(nextSha), nextSha);
+  assert.equal(next.status, "healthy");
+  await assertServing(next.id, "v2");
+  assert.equal((await db.deployment.findUniqueOrThrow({ where: { id: first.id } })).status, "stopped");
+  await assert.rejects(docker.getContainer("dd-" + first.id).inspect(), { statusCode: 404 });
+  const failed = await processResponse(await trigger(brokenSha), brokenSha);
+  assert.equal(failed.status, "failed");
+  assert.match(failed.failureReason ?? "", /deliberately-missing-lifecycle-file/);
+  await assertServing(next.id, "v2");
+  const restored = await processResponse(await post("deployments/" + first.id + "/rollback"), firstSha, 202);
+  assert.equal(restored.status, "healthy");
+  assert.equal(restored.imageTag, first.imageTag);
+  assert.equal(restored.buildStartedAt, null);
+  assert.equal(restored.buildFinishedAt, null);
+  await assertServing(restored.id, "v1");
+  assert.equal((await post("deployments/" + restored.id + "/stop")).status, 202);
+  await processStops(docker, caddy, logs);
+  assert.equal((await db.deployment.findUniqueOrThrow({ where: { id: restored.id } })).status, "stopped");
+  await assert.rejects(docker.getContainer("dd-" + restored.id).inspect(), { statusCode: 404 });
+  assert.equal(await caddy.projectRoute(projectId), null);
 });
