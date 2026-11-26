@@ -74,6 +74,8 @@ services:
       CADDY_ADMIN_SOCKET: /run/caddy-admin/admin.sock
       CADDY_ADMIN_URL: ${CADDY_ADMIN_URL:-}
       PORT_PROBE_IMAGE: ${PORT_PROBE_IMAGE:-deploydeck-worker:local}
+      STALE_JOB_GRACE_MS: ${STALE_JOB_GRACE_MS:-60000}
+      RECONCILE_INTERVAL_MS: ${RECONCILE_INTERVAL_MS:-15000}
       STARTUP_TIMEOUT: ${STARTUP_TIMEOUT:-60000}
       CONTAINER_HOST: host.docker.internal
       BASE_DOMAIN: ${BASE_DOMAIN:-localhost}
