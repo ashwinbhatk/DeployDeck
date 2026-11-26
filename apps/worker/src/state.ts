@@ -1,7 +1,7 @@
 import { db, Prisma } from "@deploydeck/db";
 export type BuildStatus = "queued" | "cloning" | "building" | "starting" | "healthy" | "stopping" | "stopped" | "failed";
 const allowed: Record<BuildStatus, BuildStatus[]> = {
-  queued: ["cloning"], cloning: ["building", "failed"], building: ["starting", "failed"], starting: ["healthy", "failed"], healthy: ["stopping"], stopping: ["stopped"], stopped: [], failed: [],
+  queued: ["cloning", "starting"], cloning: ["building", "failed"], building: ["starting", "failed"], starting: ["healthy", "failed"], healthy: ["stopping"], stopping: ["stopped"], stopped: [], failed: [],
 };
 export class StaleDeploymentError extends Error {}
 export type TransitionFields = { imageTag?: string; failureReason?: string; buildStartedAt?: Date; buildFinishedAt?: Date; healthyAt?: Date; stoppedAt?: Date };

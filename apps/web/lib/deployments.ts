@@ -75,3 +75,29 @@ export function deploymentHealth(request: Request, id: string) {
       active_routing:row.status==="healthy"&&row.project.activeDeploymentId===id,observation_source:"worker_database"});
   });
 }
+
+async function lockedDeployment(tx: Prisma.TransactionClient, id: string, userId: string) {
+  if (!/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(id)) throw new ApiError(404, "Deployment not found");
+  const owned = await tx.$queryRaw<{ id: string }[]>`
+    SELECT p.id FROM projects p JOIN deployments d ON d.project_id = p.id
+    WHERE d.id = ${id}::uuid AND p.user_id = ${userId}::uuid FOR UPDATE OF p`;
+  if (!owned.length) throw new ApiError(404, "Deployment not found");
+  return tx.deployment.findUniqueOrThrow({ where: { id } });
+}
+
+export function rollbackDeployment(request: Request, id: string) {
+  return api(async () => {
+    const user = await requireUser(request);
+    return db.$transaction(async tx => {
+      const target = await lockedDeployment(tx, id, user.id);
+      checkOrigin(request);
+      if (!["healthy", "stopped"].includes(target.status) || !target.healthyAt || !target.imageTag)
+        throw new ApiError(422, "Rollback requires a previously healthy deployment with an image");
+      const { projectId, commitSha, imageTag } = target;
+      if (await tx.deployment.count({ where: { projectId, status: { in: inFlight } } }))
+        throw new ApiError(409, "A deployment is already in progress");
+      const row = await tx.deployment.create({ data: { projectId, commitSha, imageTag, job: { create: {} } } });
+      return json({ deployment_id: row.id, status: row.status, source: "rollback", from_image: imageTag }, 202);
+    });
+  });
+}

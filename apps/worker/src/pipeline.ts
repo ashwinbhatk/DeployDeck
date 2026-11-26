@@ -2,6 +2,7 @@ import { db } from "@deploydeck/db";
 import Docker from "dockerode";
 import { BuildLogWriter, deploymentSecrets } from "./logs";
 import { clonePinnedRepository, withWorkspace } from "./workspace";
+import { isDockerError } from "./containers";
 import { buildImage, ensureDockerfile } from "./build";
 import { StaleDeploymentError, transitionDeploymentStatus } from "./state";
 import type { ClaimedJob } from "./queue";
@@ -32,7 +33,20 @@ export async function processClaimedJob(job: ClaimedJob, docker: Docker, signal:
   let log: BuildLogWriter | undefined;
   try {
     const d = await db.deployment.findUniqueOrThrow({ where: { id: job.deploymentId }, include: { project: true } });
-    if (d.status === "starting" && startRuntime) {await startRuntime(d.id);return;}
+    if (d.status === "starting" && startRuntime) {
+      if (d.imageTag && !d.buildStartedAt) {
+        try {
+          await docker.getImage(d.imageTag).inspect();
+        } catch (error) {
+          const failureReason = isDockerError(error, 404)
+            ? "Rollback image no longer exists locally" : "Unable to inspect rollback image";
+          await transitionDeploymentStatus(d.id, "starting", "failed", { failureReason });
+          return;
+        }
+      }
+      await startRuntime(d.id);
+      return;
+    }
     if (d.status !== "cloning") throw new StaleDeploymentError("Deployment is no longer cloning");
     let values: string[];
     try { values = await deploymentSecrets(d.projectId); }

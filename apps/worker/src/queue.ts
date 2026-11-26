@@ -10,7 +10,8 @@ export async function claimNextJob(workerId: string): Promise<ClaimedJob | null>
     if (!rows.length) return null;
     const job = rows[0];
     await tx.$executeRaw`UPDATE deployment_jobs SET status = 'claimed', claimed_at = now(), claimed_by = ${workerId} WHERE id = ${job.id}::uuid AND status = 'pending'`;
-    await transitionDeploymentStatus(job.deployment_id, "queued", "cloning", {}, tx);
+    const deployment = await tx.deployment.findUniqueOrThrow({ where: { id: job.deployment_id }, select: { imageTag: true } });
+    await transitionDeploymentStatus(job.deployment_id, "queued", deployment.imageTag ? "starting" : "cloning", {}, tx);
     return { id: job.id, deploymentId: job.deployment_id, workerId };
   });
 }
