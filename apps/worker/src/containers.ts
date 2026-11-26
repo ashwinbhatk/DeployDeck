@@ -9,7 +9,7 @@ export async function removeContainer(container: Docker.Container) {
 }
 // This trusted utility runs in the Docker host's network namespace, never in an app image.
 const probeScript = `const net=require('node:net');const used=new Set(JSON.parse(process.env.USED_PORTS));
-(async()=>{for(let p=20000;p<=29999;p++){if(used.has(p))continue;const s=net.createServer();const free=await new Promise(r=>{s.once('error',()=>r(false));s.listen({port:p,host:'0.0.0.0',exclusive:true},()=>r(true));});if(free){await new Promise(r=>s.close(r));console.log(p);process.exit(0);}}process.exit(2);})().catch(()=>process.exit(3));`;
+(async()=>{for(let p=20000;p<=29999;p++){if(used.has(p))continue;const s=net.createServer();const free=await new Promise(r=>{s.once('error',()=>r(false));s.listen({port:p,host:'0.0.0.0',exclusive:true},()=>r(true));});if(free){await new Promise(r=>s.close(r));console.log(String(p));return;}}process.exit(2);})().catch(()=>process.exit(3));`;
 export async function probeHostPort(docker: Docker, excluded: number[]) {
   const probe = await docker.createContainer({ Image: process.env.PORT_PROBE_IMAGE ?? "node:22-bookworm-slim", Cmd: ["node","-e",probeScript],
     Env: [`USED_PORTS=${JSON.stringify(excluded)}`], User: "1000:1000", Tty: true, Labels: { "deploydeck.role": "port-probe" },
