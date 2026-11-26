@@ -13,7 +13,7 @@ export async function verifyPublicRepo(url: string, fetcher: typeof fetch = fetc
   }
 }
 export function validBranch(value: unknown): value is string {
-  return typeof value === "string" && value.length > 0 && value.length <= 255 && value !== "@" && !value.startsWith("-") && !value.endsWith(".") && !/[\x00-\x20\x7f~^:?*\[\\]/.test(value) && !value.includes("..") && !value.includes("@{") && value.split("/").every(p => p.length > 0 && !p.startsWith(".") && !p.endsWith(".lock"));
+  return typeof value === "string" && !/[;&|$`<>(){}'"!#]/.test(value) && value.length > 0 && value.length <= 255 && value !== "@" && !value.startsWith("-") && !value.endsWith(".") && !/[\x00-\x20\x7f~^:?*\[\\]/.test(value) && !value.includes("..") && !value.includes("@{") && value.split("/").every(p => p.length > 0 && !p.startsWith(".") && !p.endsWith(".lock"));
 }
 export type ProjectInput = { name?: string; repo_url?: string; branch?: string; port?: number; health_check_path?: string; environment_variables?: Record<string, string | null> };
 export function projectInput(input: Record<string, unknown>, patch = false): ProjectInput {

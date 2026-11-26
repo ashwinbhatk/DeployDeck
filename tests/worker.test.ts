@@ -73,3 +73,10 @@ test("finally completes a claimed job even when processing throws",async()=>{
  assert.equal((await db.deploymentJob.findUniqueOrThrow({where:{deploymentId:d.id}})).status,"done");
  await assert.rejects(finishJob({id:d.job!.id,deploymentId:d.id,workerId:"another-worker"}),/ownership changed/);
 });
+
+test("transition guard rejects skipped phases and terminal-state resurrection", async () => {
+  const id = randomUUID();
+  for (const [from, to] of [["queued", "healthy"], ["failed", "starting"], ["stopped", "healthy"]] as const) {
+    await assert.rejects(transitionDeploymentStatus(id, from, to), { message: "Invalid deployment transition: " + from + " -> " + to });
+  }
+});

@@ -124,3 +124,19 @@ test("create encryption failure leaves no project or environment rows",async()=>
   try {assert.equal((await create(request("projects","POST",{name:"Rejected",repo_url:"https://github.com/example/repo",port:3000,environment_variables:{TOKEN:"secret"}}))).status,500);}finally{process.env.ENCRYPTION_KEY=previous;stub.mock.restore();}
   assert.equal(await db.project.count({where:{userId:ids[0]}}),before);
 });
+
+test("project creation returns field-level 422 for disallowed repository schemes, hosts and shell punctuation", async t => {
+  const network = t.mock.method(globalThis, "fetch", async () => { throw new Error("Unexpected outbound request"); });
+  const valid = { name: "Validation", repo_url: "https://github.com/example/repo", port: 3000 };
+  for (const [field, values] of Object.entries({
+    repo_url: ["file:///fixture", "http://127.0.0.1/example/repo", "https://example.test/example/repo"],
+    branch: ["feature;one", "release|two", "topic&three", "topic$four", "topic(five)"],
+  })) {
+    for (const value of values) {
+      const response = await create(request("projects", "POST", { ...valid, [field]: value }));
+      assert.equal(response.status, 422);
+      assert((await response.json()).fields[field]);
+    }
+  }
+  assert.equal(network.mock.callCount(), 0);
+});

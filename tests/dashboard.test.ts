@@ -120,3 +120,15 @@ test("production dashboard routes serve account forms and protect all three work
     assert.equal(page.status, 200); assert((await page.text()).includes(email));
   }
 });
+
+test("every project and deployment resource endpoint conceals cross-user resources", async () => {
+  const d = await deployment("stopped");
+  const p = "/api/projects/" + project, path = "/api/deployments/" + d.id;
+  for (const [method, route] of [
+    ["GET", p], ["PATCH", p], ["GET", p + "/deployments"], ["POST", p + "/deployments"],
+    ["GET", path], ["GET", path + "/logs"], ["GET", path + "/health"], ["POST", path + "/rollback"], ["POST", path + "/stop"],
+  ]) {
+    const res = await fetch(origin + route, { method, headers: { cookie: cookie(other) } });
+    assert.equal(res.status, 404, method + " " + route);
+  }
+});
