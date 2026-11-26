@@ -1,5 +1,5 @@
 "use client";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 
 export async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const response = await fetch(path, { cache: "no-store", ...options });
@@ -30,5 +30,6 @@ export function useResource<T>(path: string) {
     }).catch(e => { if (!controller.signal.aborted) setError(e.message); });
     return () => controller.abort();
   }, [path, revision]);
-  return { data, error, refresh: () => setRevision(n => n + 1) };
+  const refresh = useCallback(() => setRevision(n => n + 1), []);
+  return { data, error, refresh };
 }
