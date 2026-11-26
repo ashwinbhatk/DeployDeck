@@ -51,7 +51,7 @@ export async function startContainer(deploymentId: string, docker: Docker, signa
       const network=await ensureProjectNetwork(docker,d.projectId);
       const assigned=await tx.deployment.findMany({where:{hostPort:{not:null},OR:[{status:{in:["starting","healthy","stopping"]}},{containerId:{not:null}}]},select:{hostPort:true}});
       const existing=await docker.listContainers({all:true});
-      const used=new Set([...assigned.map(r=>r.hostPort!),...existing.flatMap(c=>c.Ports.map(p=>p.PublicPort).filter((p):p is number=>!!p))]);
+      const used=new Set([...assigned.map(r=>r.hostPort!),...existing.flatMap(c=>(c.Ports ?? []).map(p=>p.PublicPort).filter((p):p is number=>!!p))]);
       for(let attempt=0;attempt<5;attempt++) {
         signal.throwIfAborted();
         const port=await probeHostPort(docker,[...used]);used.add(port);reservedPort=port;
